@@ -78,7 +78,7 @@ export class MobileCronWeb extends WebPlugin implements MobileCronPlugin {
   async addListener(event: 'statusChanged', handler: (data: CronStatus) => void): Promise<PluginListenerHandle>
   async addListener(
     event: 'nativeWake',
-    handler: (data: { source: WakeSource; paused?: boolean }) => void
+    handler: (data: { source: WakeSource; paused?: boolean }) => void,
   ): Promise<PluginListenerHandle>
   async addListener(eventName: string, listenerFunc: (data: any) => void): Promise<PluginListenerHandle> {
     return super.addListener(eventName, listenerFunc)

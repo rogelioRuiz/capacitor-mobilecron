@@ -16,7 +16,10 @@ export interface MobileCronPlugin {
   addListener(event: 'jobSkipped', handler: (data: JobSkippedEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'overdueJobs', handler: (data: OverdueEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'statusChanged', handler: (data: CronStatus) => void): Promise<PluginListenerHandle>
-  addListener(event: 'nativeWake', handler: (data: { source: WakeSource; paused?: boolean }) => void): Promise<PluginListenerHandle>
+  addListener(
+    event: 'nativeWake',
+    handler: (data: { source: WakeSource; paused?: boolean }) => void,
+  ): Promise<PluginListenerHandle>
 
   // E2E test hooks (not for production use)
   testNativeEvaluate(): Promise<{ firedCount: number }>
