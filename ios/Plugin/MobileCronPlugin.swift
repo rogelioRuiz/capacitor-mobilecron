@@ -16,7 +16,10 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "resumeAll", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setMode", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getStatus", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "__testNativeEvaluate", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "testNativeEvaluate", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "testSetNextDueAt", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "testInjectPendingEvent", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "testGetPendingCount", returnType: CAPPluginReturnPromise)
     ]
 
     private static let storageKey = "mobilecron:state"
@@ -94,6 +97,8 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         guard let data = try? JSONSerialization.data(withJSONObject: state),
               let raw = String(data: data, encoding: .utf8) else { return }
         UserDefaults.standard.set(raw, forKey: Self.storageKey)
+        // Force immediate disk flush so state survives simctl terminate / force-kill
+        UserDefaults.standard.synchronize()
     }
 
     // ── Background wake ───────────────────────────────────────────────────────
@@ -129,6 +134,7 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         if let newData = try? JSONSerialization.data(withJSONObject: state),
            let newRaw = String(data: newData, encoding: .utf8) {
             UserDefaults.standard.set(newRaw, forKey: Self.storageKey)
+            UserDefaults.standard.synchronize()
         }
     }
 
@@ -255,12 +261,65 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         call.resolve(buildStatus())
     }
 
-    /// E2E test hook: directly calls NativeJobEvaluator.evaluate() and fires pending events.
-    /// Used to test native background evaluation without BGTaskScheduler.
-    @objc func __testNativeEvaluate(_ call: CAPPluginCall) {
+    // ── E2E test hooks (not for production use) ───────────────────────────────
+
+    /// Calls NativeJobEvaluator.evaluate() directly and fires pending events.
+    @objc func testNativeEvaluate(_ call: CAPPluginCall) {
         let events = NativeJobEvaluator.evaluate(source: "test_trigger")
         firePendingNativeEvents()
         call.resolve(["firedCount": events.count])
+    }
+
+    /// Sets a job's nextDueAt in memory and saves to UserDefaults.
+    /// Allows tests to mark a job as "due" without waiting for real time to pass.
+    @objc func testSetNextDueAt(_ call: CAPPluginCall) {
+        guard let id = call.getString("id"),
+              let nextDueAtMs = call.getInt("nextDueAtMs"),
+              jobs[id] != nil else {
+            call.reject("id or nextDueAtMs missing, or job not found")
+            return
+        }
+        jobs[id]?["nextDueAt"] = nextDueAtMs
+        saveState()
+        call.resolve()
+    }
+
+    /// Appends a pending native event to UserDefaults storage.
+    /// Allows tests to simulate what NativeJobEvaluator writes during background execution.
+    @objc func testInjectPendingEvent(_ call: CAPPluginCall) {
+        guard let event = call.getObject("event") else {
+            call.reject("event is required")
+            return
+        }
+        guard let raw = UserDefaults.standard.string(forKey: Self.storageKey),
+              let data = raw.data(using: .utf8),
+              var state = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            call.reject("State not found in UserDefaults")
+            return
+        }
+        var pending = (state["pendingNativeEvents"] as? [[String: Any]]) ?? []
+        pending.append(event)
+        state["pendingNativeEvents"] = pending
+        guard let newData = try? JSONSerialization.data(withJSONObject: state),
+              let newRaw = String(data: newData, encoding: .utf8) else {
+            call.reject("Serialization failed")
+            return
+        }
+        UserDefaults.standard.set(newRaw, forKey: Self.storageKey)
+        UserDefaults.standard.synchronize()
+        call.resolve()
+    }
+
+    /// Returns the count of pendingNativeEvents currently in UserDefaults storage.
+    @objc func testGetPendingCount(_ call: CAPPluginCall) {
+        guard let raw = UserDefaults.standard.string(forKey: Self.storageKey),
+              let data = raw.data(using: .utf8),
+              let state = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            call.resolve(["count": 0])
+            return
+        }
+        let count = (state["pendingNativeEvents"] as? [[String: Any]])?.count ?? 0
+        call.resolve(["count": count])
     }
 
     private func buildStatus() -> [String: Any] {

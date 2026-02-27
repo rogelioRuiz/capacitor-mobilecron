@@ -83,4 +83,20 @@ export class MobileCronWeb extends WebPlugin implements MobileCronPlugin {
   async addListener(eventName: string, listenerFunc: (data: any) => void): Promise<PluginListenerHandle> {
     return super.addListener(eventName, listenerFunc)
   }
+
+  async testNativeEvaluate(): Promise<{ firedCount: number }> {
+    return { firedCount: 0 }
+  }
+
+  async testSetNextDueAt(_options: { id: string; nextDueAtMs: number }): Promise<void> {
+    return
+  }
+
+  async testInjectPendingEvent(_options: { event: Record<string, unknown> }): Promise<void> {
+    return
+  }
+
+  async testGetPendingCount(): Promise<{ count: number }> {
+    return { count: 0 }
+  }
 }
