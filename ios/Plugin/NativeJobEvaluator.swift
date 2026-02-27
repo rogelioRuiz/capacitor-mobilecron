@@ -134,7 +134,7 @@ final class NativeJobEvaluator {
             }
 
             if let nextData = try? JSONSerialization.data(withJSONObject: state),
-               let nextRaw = String(nextData, encoding: .utf8) {
+               let nextRaw = String(data: nextData, encoding: .utf8) {
                 writeStateRaw(nextRaw)
             }
         }
