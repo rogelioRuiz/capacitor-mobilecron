@@ -1,6 +1,6 @@
 {
   "name": "capacitor-mobilecron",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "description": "Capacitor scheduling primitive that emits job due events across web, Android, and iOS",
   "main": "dist/esm/index.js",
   "module": "dist/esm/index.js",
