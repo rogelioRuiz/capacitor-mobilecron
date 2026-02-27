@@ -545,7 +545,9 @@
 
           // ── Setup for Phase 3 (Sections 7, 8) ─────────────────────────
           setStatus('Phase 2 done. Setting up Phase 3 state...')
+          await postResult('P3-SETUP: cleanAll', 'pass', 'starting')
           await cleanAll()
+          await postResult('P3-SETUP: register', 'pass', 'starting')
 
           // Inject a pending native event to test 8.2 (firePendingNativeEvents on relaunch)
           const { id: jobFor8_2 } = await MC.register({
@@ -554,7 +556,8 @@
             data: { sentinel: 'native-e2e' }
           })
           await new Promise(r => setTimeout(r, 300))
-          // Use native test hook to inject event directly into UserDefaults storage
+          await postResult('P3-SETUP: testInjectPendingEvent', 'pass', 'calling id=' + jobFor8_2)
+          // Use native test hook to inject event directly into storage
           await MC.testInjectPendingEvent({
             event: {
               id: jobFor8_2,
@@ -564,6 +567,7 @@
               data: { sentinel: 'native-e2e' }
             }
           })
+          await postResult('P3-SETUP: done', 'pass', 'all setup complete')
 
           localStorage.setItem('mcron_phase', 'phase3')
           localStorage.setItem('mcron_8_2_jobid', jobFor8_2)
