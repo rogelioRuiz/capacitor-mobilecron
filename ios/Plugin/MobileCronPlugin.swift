@@ -260,10 +260,11 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
 
     // ── E2E test hooks (not for production use) ───────────────────────────────
 
-    /// Calls NativeJobEvaluator.evaluate() directly and fires pending events.
+    /// Calls NativeJobEvaluator.evaluate() directly, fires pending events, and
+    /// emits nativeWake (mirrors what BGTaskManager does on real background wake).
     @objc func testNativeEvaluate(_ call: CAPPluginCall) {
         let events = NativeJobEvaluator.evaluate(source: "test_trigger")
-        firePendingNativeEvents()
+        handleBackgroundWake(source: "test_trigger")
         call.resolve(["firedCount": events.count])
     }
 

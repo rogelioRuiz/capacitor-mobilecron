@@ -457,6 +457,10 @@
         })
 
         if (cycleNum === 0) {
+          // Tests 2.3/2.4 cleaned up paused/mode state. Re-set them so they
+          // persist through 5 kill cycles and can be re-verified at cycle 5.
+          await MC.pauseAll()
+          await MC.setMode({ mode: 'eco' })
           // Start the 5 cycles for test 2.5
           await MC.register({ name: 'cycle-job-1', schedule: { kind: 'every', everyMs: 60000 } })
           localStorage.setItem('mcron_cycle_num', '1')
@@ -672,9 +676,24 @@
       await postDone(passed, failed, total)
     }
 
-  })().catch(err => {
+  })().catch(async err => {
     document.getElementById('status').textContent = 'Fatal error: ' + err.message
     console.error('E2E fatal:', err)
+    // Report fatal error to runner so it doesn't hang waiting for __mobilecron_done
+    try {
+      await fetch('http://127.0.0.1:8099/__mobilecron_result', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'FATAL ERROR', status: 'fail', error: err.message }),
+        keepalive: true
+      })
+      await fetch('http://127.0.0.1:8099/__mobilecron_done', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passed: 0, failed: 1, total: 1, fatal: err.message }),
+        keepalive: true
+      })
+    } catch {}
   })
   </script>
 </body>
