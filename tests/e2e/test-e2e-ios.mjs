@@ -267,19 +267,21 @@ async function main() {
       console.log(`  → cap sync skipped: ${(e.stderr || e.message || '').split('\n')[0]}`)
     }
 
-    const derivedDataPath = '/tmp/mobilecron-e2e-dd'
+    // Touch a marker before build so we can find the NEWLY built App.app afterward.
+    execSync('touch /tmp/.mobilecron-build-marker', { shell: true })
     console.log('  → Building with xcodebuild...')
     execSync(
       `xcodebuild -workspace App.xcworkspace -scheme App -sdk iphonesimulator ` +
-      `-destination "platform=iOS Simulator,id=${udid}" -configuration Debug ` +
-      `-derivedDataPath ${derivedDataPath} build ` +
+      `-destination "platform=iOS Simulator,id=${udid}" -configuration Debug build ` +
       `CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO`,
       { cwd: iosDir, encoding: 'utf8', timeout: 300000, stdio: ['ignore', 'pipe', 'pipe'] }
     )
 
     console.log('  → Installing app...')
+    // Find the App.app built AFTER our marker — avoids picking a stale build from DerivedData.
     const appPath = execSync(
-      `find ${derivedDataPath} -name "App.app" ` +
+      `find ~/Library/Developer/Xcode/DerivedData -name "App.app" ` +
+      `-newer /tmp/.mobilecron-build-marker ` +
       `-path "*/Debug-iphonesimulator/*" -not -path "*PlugIns*" 2>/dev/null | head -1`,
       { encoding: 'utf8', shell: true }
     ).trim()
