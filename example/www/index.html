@@ -140,6 +140,14 @@
 
     setStatus('iOS test mode detected — running full E2E suite...')
 
+    // Capacitor may not generate JS proxy stubs for test hook methods.
+    // Polyfill them via nativePromise (direct bridge call).
+    const nativeCall = (method, opts) =>
+      window.Capacitor.nativePromise('MobileCron', method, opts || {})
+    if (!MC.testNativeEvaluate) MC.testNativeEvaluate = (opts) => nativeCall('testNativeEvaluate', opts)
+    if (!MC.testSetNextDueAt) MC.testSetNextDueAt = (opts) => nativeCall('testSetNextDueAt', opts)
+    if (!MC.testGetPendingCount) MC.testGetPendingCount = (opts) => nativeCall('testGetPendingCount', opts)
+
     // ─── Test harness ────────────────────────────────────────────────────────
     let passed = 0, failed = 0, total = 0
 
