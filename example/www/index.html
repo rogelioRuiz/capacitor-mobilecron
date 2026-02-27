@@ -138,17 +138,6 @@
       return
     }
 
-    // Wrap test hooks that may not be on the Capacitor proxy (they exist natively
-    // but Capacitor may not generate JS stubs for them). Call via nativePromise.
-    const nativeCall = (method, options) =>
-      window.Capacitor.nativePromise('MobileCron', method, options || {})
-
-    // Attach test hooks to MC if missing
-    if (!MC.testNativeEvaluate) MC.testNativeEvaluate = (opts) => nativeCall('testNativeEvaluate', opts)
-    if (!MC.testSetNextDueAt) MC.testSetNextDueAt = (opts) => nativeCall('testSetNextDueAt', opts)
-    if (!MC.testInjectPendingEvent) MC.testInjectPendingEvent = (opts) => nativeCall('testInjectPendingEvent', opts)
-    if (!MC.testGetPendingCount) MC.testGetPendingCount = (opts) => nativeCall('testGetPendingCount', opts)
-
     setStatus('iOS test mode detected — running full E2E suite...')
 
     // ─── Test harness ────────────────────────────────────────────────────────
@@ -188,20 +177,9 @@
       await MC.setMode({ mode: 'balanced' })
     }
 
-    // readState() reads current plugin state via the native bridge.
-    // This is reliable because it bypasses @capacitor/preferences key-prefix issues.
-    async function readState() {
-      try {
-        const [{ jobs }, status] = await Promise.all([MC.list(), MC.getStatus()])
-        return { jobs, paused: status.paused, mode: status.mode, version: 1 }
-      } catch { return null }
-    }
-
     // ─── PHASE DETECTION ─────────────────────────────────────────────────────
     const phase = localStorage.getItem('mcron_phase') || 'phase1'
     setStatus('Running phase: ' + phase)
-    // Log phase to HTTP server for debugging
-    await postResult('PHASE: ' + phase, 'pass', 'cycle=' + (localStorage.getItem('mcron_cycle_num') || 'n/a'))
 
     // ════════════════════════════════════════════════════════════════════════
     // PHASE 1: Sections 1, 3, 4, 5 — pure API tests
@@ -543,154 +521,122 @@
             await cleanAll()
           })
 
-          // ── Setup for Phase 3 (Sections 7, 8) ─────────────────────────
-          setStatus('Phase 2 done. Setting up Phase 3 state...')
-          await postResult('P3-SETUP: cleanAll', 'pass', 'starting')
+          // ── Section 7: Diagnostics (runs inline after section 6) ──────
           await cleanAll()
-          await postResult('P3-SETUP: register', 'pass', 'starting')
 
-          // Inject a pending native event to test 8.2 (firePendingNativeEvents on relaunch)
-          const { id: jobFor8_2 } = await MC.register({
-            name: 'pending-inject',
-            schedule: { kind: 'every', everyMs: 60000 },
-            data: { sentinel: 'native-e2e' }
+          await t('7.1 BGTaskScheduler is registered and functional', async () => {
+            const s = await MC.getStatus()
+            assert(s.ios?.bgRefreshRegistered === true, 'bgRefreshRegistered'); assert(s.ios?.bgProcessingRegistered === true, 'bgProcessingRegistered')
           })
-          await new Promise(r => setTimeout(r, 300))
-          await postResult('P3-SETUP: testInjectPendingEvent', 'pass', 'calling id=' + jobFor8_2)
-          // Use native test hook to inject event directly into storage
-          await MC.testInjectPendingEvent({
-            event: {
-              id: jobFor8_2,
-              name: 'pending-inject',
-              firedAt: Date.now() - 2000,
-              source: 'bgtask_refresh',
-              data: { sentinel: 'native-e2e' }
-            }
+          await t('7.2 BGTask identifiers match plugin bundle', async () => {
+            const s = await MC.getStatus(); assert(s.ios?.bgRefreshRegistered, 'Refresh task registered'); assert(s.ios?.bgProcessingRegistered, 'Processing task registered')
           })
-          await postResult('P3-SETUP: done', 'pass', 'all setup complete')
+          await t('7.3 nativeWake event listener can be attached', async () => {
+            let got = false
+            const h = await MC.addListener('nativeWake', () => { got = true })
+            await MC.testNativeEvaluate()
+            await new Promise(r => setTimeout(r, 400))
+            h.remove()
+            assert(got, 'nativeWake must fire when handleBackgroundWake is called')
+          })
+          await t('7.4 Diagnostics report platform-specific fields', async () => {
+            const s = await MC.getStatus()
+            eq(s.platform, 'ios', 'platform'); assert(typeof s.paused === 'boolean', 'paused is bool'); assert(typeof s.activeJobCount === 'number', 'activeJobCount is number'); assert(s.ios !== undefined, 'ios field exists'); assert(s.android === undefined, 'android field absent on iOS')
+          })
+          await t('7.5 Process not killed during tests (stability check)', async () => {
+            for (let i = 0; i < 5; i++) { const s = await MC.getStatus(); eq(s.platform, 'ios', 'alive:' + i) }
+          })
 
-          localStorage.setItem('mcron_phase', 'phase3')
-          localStorage.setItem('mcron_8_2_jobid', jobFor8_2)
+          // ── Section 8: Native Background (runs inline) ──────────────────
+          await t('8.1 UserDefaults stores key "mobilecron:state" without group prefix', async () => {
+            await cleanAll()
+            await MC.register({ name: 'key-check', schedule: { kind: 'every', everyMs: 60000 } })
+            await new Promise(r => setTimeout(r, 200))
+            const { jobs } = await MC.list()
+            assert(jobs.length >= 1, 'Jobs must be accessible via native bridge (UserDefaults stored correctly)')
+            const s = await MC.getStatus()
+            assert(s.activeJobCount >= 1, 'getStatus must report active jobs (state persisted to UserDefaults)')
+            await cleanAll()
+          }, 10000)
 
-          setStatus('Phase 2 complete. Requesting kill+relaunch...')
-          await requestKillAndRelaunch(1500)
+          await t('8.2 Pending native events in storage deliver as jobDue (rehydrate path)', async () => {
+            await cleanAll()
+            // Register a job, mark it as due, evaluate natively — this writes a pendingNativeEvent
+            const { id } = await MC.register({ name: 'pending-test', schedule: { kind: 'every', everyMs: 60000 } })
+            await new Promise(r => setTimeout(r, 200))
+            await MC.testSetNextDueAt({ id, nextDueAtMs: Date.now() - 5000 })
+            // testNativeEvaluate → evaluate() writes to pendingNativeEvents
+            // then handleBackgroundWake → firePendingNativeEvents() fires them as jobDue events
+            const fired = []
+            await MC.addListener('jobDue', e => { if (e.id === id) fired.push(e) })
+            await MC.testNativeEvaluate()
+            await new Promise(r => setTimeout(r, 400))
+            assert(fired.length >= 1, 'jobDue must fire from pending native event: ' + fired.length)
+            // Verify pendingNativeEvents were cleared from storage after delivery
+            const { count } = await MC.testGetPendingCount()
+            eq(count, 0, 'pendingNativeEvents must be cleared after delivery')
+            await cleanAll()
+          })
+
+          await t('8.3 NativeJobEvaluator fires due job via test hook and delivers via rehydrate', async () => {
+            await cleanAll()
+            const { id } = await MC.register({ name: 'native-eval-test', schedule: { kind: 'every', everyMs: 60000 } })
+            await new Promise(r => setTimeout(r, 200))
+            await MC.testSetNextDueAt({ id, nextDueAtMs: Date.now() - 10000 })
+            const fired = []
+            await MC.addListener('jobDue', e => { if (e.id === id) fired.push(e.source) })
+            const result = await MC.testNativeEvaluate()
+            await new Promise(r => setTimeout(r, 400))
+            assert(result.firedCount >= 1, 'NativeJobEvaluator firedCount: ' + result.firedCount)
+            assert(fired.length >= 1, 'jobDue must be delivered: ' + JSON.stringify(fired))
+            eq(fired[0], 'test_trigger', 'source must be test_trigger')
+            await cleanAll()
+          })
+
+          await t('8.4 NativeJobEvaluator skips due jobs when scheduler is paused', async () => {
+            await cleanAll(); await MC.pauseAll()
+            const { id } = await MC.register({ name: 'paused-native', schedule: { kind: 'every', everyMs: 60000 } })
+            await new Promise(r => setTimeout(r, 200))
+            const s = await MC.getStatus()
+            assert(s.paused === true, 'State must be paused')
+            await MC.testSetNextDueAt({ id, nextDueAtMs: Date.now() - 10000 })
+            const fired = []; await MC.addListener('jobDue', e => { if (e.id === id) fired.push(e.id) })
+            await MC.testNativeEvaluate(); await new Promise(r => setTimeout(r, 300))
+            assert(fired.length === 0, 'Paused job must NOT fire: ' + JSON.stringify(fired))
+            const { jobs } = await MC.list()
+            const afterJob = jobs.find(j => j.id === id)
+            assert((afterJob?.consecutiveSkips ?? 0) > 0, 'consecutiveSkips must be >0 after skip')
+            await MC.resumeAll(); await cleanAll()
+          })
+
+          await t('8.5 nextDueAt advances after native evaluation — job fires exactly once', async () => {
+            await cleanAll()
+            const { id } = await MC.register({ name: 'dedup-test', schedule: { kind: 'every', everyMs: 60000 } })
+            await new Promise(r => setTimeout(r, 200))
+            await MC.testSetNextDueAt({ id, nextDueAtMs: Date.now() - 5000 })
+            const fired = []; await MC.addListener('jobDue', e => { if (e.id === id) fired.push(e.id) })
+            await MC.testNativeEvaluate(); await new Promise(r => setTimeout(r, 400))
+            eq(fired.length, 1, 'Job must fire exactly once, got ' + fired.length + 'x')
+            const { jobs } = await MC.list()
+            const afterJob = jobs.find(j => j.id === id)
+            assert((afterJob?.nextDueAt ?? 0) > Date.now(), 'nextDueAt must be future after native fire')
+            await cleanAll()
+          })
+
+          // ── Cleanup and done ──────────────────────────────────────────
+          localStorage.removeItem('mcron_phase')
+          localStorage.removeItem('mcron_p2jobs')
+          localStorage.removeItem('mcron_cycle_num')
+
+          const color = failed === 0 ? '#22c55e' : '#ef4444'
+          document.getElementById('summary').innerHTML =
+            '<span style="color:' + color + ';font-weight:bold">' + passed + '/' + total +
+            (failed > 0 ? ' passed — ' + failed + ' FAILED' : ' passed — ALL PASS') + '</span>'
+          setStatus('Done: ' + passed + '/' + total + ' passed')
+
+          await postDone(passed, failed, total)
         }
       }
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // PHASE 3: Sections 7, 8 — diagnostics + native background
-    // ════════════════════════════════════════════════════════════════════════
-    if (phase === 'phase3') {
-      setStatus('Phase 3: Sections 7, 8...')
-
-      // Check if pendingNativeEvents were cleared by firePendingNativeEvents() on relaunch
-      const { count: pendingCount } = await MC.testGetPendingCount()
-      const pendingCleared = pendingCount === 0
-
-      // ── Section 7: Diagnostics ─────────────────────────────────────────
-      await t('7.1 BGTaskScheduler is registered and functional', async () => {
-        const s = await MC.getStatus()
-        assert(s.ios?.bgRefreshRegistered === true, 'bgRefreshRegistered'); assert(s.ios?.bgProcessingRegistered === true, 'bgProcessingRegistered')
-      })
-      await t('7.2 BGTask identifiers match plugin bundle', async () => {
-        const s = await MC.getStatus(); assert(s.ios?.bgRefreshRegistered, 'Refresh task registered'); assert(s.ios?.bgProcessingRegistered, 'Processing task registered')
-      })
-      await t('7.3 nativeWake event listener can be attached', async () => {
-        let got = false
-        const h = await MC.addListener('nativeWake', () => { got = true })
-        // testNativeEvaluate calls handleBackgroundWake which fires nativeWake
-        await MC.testNativeEvaluate()
-        await new Promise(r => setTimeout(r, 400))
-        h.remove()
-        assert(got, 'nativeWake must fire when handleBackgroundWake is called')
-      })
-      await t('7.4 Diagnostics report platform-specific fields', async () => {
-        const s = await MC.getStatus()
-        eq(s.platform, 'ios', 'platform'); assert(typeof s.paused === 'boolean', 'paused is bool'); assert(typeof s.activeJobCount === 'number', 'activeJobCount is number'); assert(s.ios !== undefined, 'ios field exists'); assert(s.android === undefined, 'android field absent on iOS')
-      })
-      await t('7.5 Process not killed during tests (stability check)', async () => {
-        for (let i = 0; i < 5; i++) { const s = await MC.getStatus(); eq(s.platform, 'ios', 'alive:' + i) }
-      })
-
-      // ── Section 8: Native Background ──────────────────────────────────
-      await t('8.1 UserDefaults stores key "mobilecron:state" without group prefix', async () => {
-        await cleanAll()
-        await MC.register({ name: 'key-check', schedule: { kind: 'every', everyMs: 60000 } })
-        await new Promise(r => setTimeout(r, 200))
-        const { jobs } = await MC.list()
-        assert(jobs.length >= 1, 'Jobs must be accessible via native bridge (UserDefaults stored correctly)')
-        const s = await MC.getStatus()
-        assert(s.activeJobCount >= 1, 'getStatus must report active jobs (state persisted to UserDefaults)')
-        await cleanAll()
-      }, 10000)
-
-      await t('8.2 Pending native events in storage deliver as jobDue on foreground (rehydrate path)', async () => {
-        // Injected event should have been fired and cleared by firePendingNativeEvents() on launch
-        assert(pendingCleared, 'pendingNativeEvents must be cleared after applicationDidBecomeActive. Count still in storage: ' + pendingCount)
-      })
-
-      await t('8.3 NativeJobEvaluator fires due job via test hook and delivers via rehydrate', async () => {
-        await cleanAll()
-        const { id } = await MC.register({ name: 'native-eval-test', schedule: { kind: 'every', everyMs: 60000 } })
-        await new Promise(r => setTimeout(r, 200))
-        // Mark job as due using native test hook (writes directly to UserDefaults)
-        await MC.testSetNextDueAt({ id, nextDueAtMs: Date.now() - 10000 })
-        const fired = []
-        await MC.addListener('jobDue', e => { if (e.id === id) fired.push(e.source) })
-        const result = await MC.testNativeEvaluate()
-        await new Promise(r => setTimeout(r, 400))
-        assert(result.firedCount >= 1, 'NativeJobEvaluator firedCount: ' + result.firedCount)
-        assert(fired.length >= 1, 'jobDue must be delivered: ' + JSON.stringify(fired))
-        eq(fired[0], 'test_trigger', 'source must be test_trigger')
-        await cleanAll()
-      })
-
-      await t('8.4 NativeJobEvaluator skips due jobs when scheduler is paused', async () => {
-        await cleanAll(); await MC.pauseAll()
-        const { id } = await MC.register({ name: 'paused-native', schedule: { kind: 'every', everyMs: 60000 } })
-        await new Promise(r => setTimeout(r, 200))
-        const s = await MC.getStatus()
-        assert(s.paused === true, 'State must be paused')
-        // Mark job as due using native test hook
-        await MC.testSetNextDueAt({ id, nextDueAtMs: Date.now() - 10000 })
-        const fired = []; await MC.addListener('jobDue', e => { if (e.id === id) fired.push(e.id) })
-        await MC.testNativeEvaluate(); await new Promise(r => setTimeout(r, 300))
-        assert(fired.length === 0, 'Paused job must NOT fire: ' + JSON.stringify(fired))
-        const { jobs } = await MC.list()
-        const afterJob = jobs.find(j => j.id === id)
-        assert((afterJob?.consecutiveSkips ?? 0) > 0, 'consecutiveSkips must be >0 after skip')
-        await MC.resumeAll(); await cleanAll()
-      })
-
-      await t('8.5 nextDueAt advances after native evaluation — job fires exactly once', async () => {
-        await cleanAll()
-        const { id } = await MC.register({ name: 'dedup-test', schedule: { kind: 'every', everyMs: 60000 } })
-        await new Promise(r => setTimeout(r, 200))
-        // Mark job as due using native test hook
-        await MC.testSetNextDueAt({ id, nextDueAtMs: Date.now() - 5000 })
-        const fired = []; await MC.addListener('jobDue', e => { if (e.id === id) fired.push(e.id) })
-        await MC.testNativeEvaluate(); await new Promise(r => setTimeout(r, 400))
-        eq(fired.length, 1, 'Job must fire exactly once, got ' + fired.length + 'x')
-        const { jobs } = await MC.list()
-        const afterJob = jobs.find(j => j.id === id)
-        assert((afterJob?.nextDueAt ?? 0) > Date.now(), 'nextDueAt must be future after native fire')
-        await cleanAll()
-      })
-
-      // ── Cleanup and done ──────────────────────────────────────────────
-      localStorage.removeItem('mcron_phase')
-      localStorage.removeItem('mcron_p2jobs')
-      localStorage.removeItem('mcron_cycle_num')
-      localStorage.removeItem('mcron_8_2_jobid')
-
-      const color = failed === 0 ? '#22c55e' : '#ef4444'
-      document.getElementById('summary').innerHTML =
-        '<span style="color:' + color + ';font-weight:bold">' + passed + '/' + total +
-        (failed > 0 ? ' passed — ' + failed + ' FAILED' : ' passed — ALL PASS') + '</span>'
-      setStatus('Done: ' + passed + '/' + total + ' passed')
-
-      await postDone(passed, failed, total)
     }
 
   })().catch(async err => {

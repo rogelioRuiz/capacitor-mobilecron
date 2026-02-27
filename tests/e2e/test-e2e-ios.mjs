@@ -221,7 +221,7 @@ const ORDERED_TESTS = [
   '7.4 Diagnostics report platform-specific fields',
   '7.5 Process not killed during tests (stability check)',
   '8.1 UserDefaults stores key "mobilecron:state" without group prefix',
-  '8.2 Pending native events in storage deliver as jobDue on foreground (rehydrate path)',
+  '8.2 Pending native events in storage deliver as jobDue (rehydrate path)',
   '8.3 NativeJobEvaluator fires due job via test hook and delivers via rehydrate',
   '8.4 NativeJobEvaluator skips due jobs when scheduler is paused',
   '8.5 nextDueAt advances after native evaluation — job fires exactly once',
