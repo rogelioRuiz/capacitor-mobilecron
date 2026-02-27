@@ -1,5 +1,6 @@
 import Foundation
 import Capacitor
+import UIKit
 
 @objc(MobileCronPlugin)
 public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
@@ -14,8 +15,11 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "pauseAll", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "resumeAll", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setMode", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "getStatus", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "getStatus", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "__testNativeEvaluate", returnType: CAPPluginReturnPromise)
     ]
+
+    private static let storageKey = "mobilecron:state"
 
     private var jobs: [String: [String: Any]] = [:]
     private var paused = false
@@ -23,19 +27,112 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
     var currentMode: String { mode }
     private var bgManager: BGTaskManager?
 
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
     public override func load() {
         super.load()
+        loadState()
+        firePendingNativeEvents()
         let manager = BGTaskManager(plugin: self)
         manager.registerBGTasks()
         manager.scheduleRefresh()
         manager.scheduleProcessing(requiresExternalPower: true)
         self.bgManager = manager
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+    }
+
+    @objc private func appDidBecomeActive() {
+        firePendingNativeEvents()
     }
 
     func handleBackgroundWake(source: String) {
+        firePendingNativeEvents()
         notifyListeners("statusChanged", data: buildStatus())
         notifyListeners("nativeWake", data: ["source": source, "paused": paused])
     }
+
+    // ── Persistence ───────────────────────────────────────────────────────────
+
+    private func loadState() {
+        guard let raw = UserDefaults.standard.string(forKey: Self.storageKey),
+              let data = raw.data(using: .utf8),
+              let state = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return
+        }
+        paused = (state["paused"] as? Bool) ?? false
+        mode = (state["mode"] as? String) ?? "balanced"
+        jobs = [:]
+        if let jobsArr = state["jobs"] as? [[String: Any]] {
+            for job in jobsArr {
+                if let id = job["id"] as? String, !id.isEmpty {
+                    jobs[id] = job
+                }
+            }
+        }
+    }
+
+    private func saveState() {
+        var state: [String: Any] = [
+            "version": 1,
+            "paused": paused,
+            "mode": mode,
+            "jobs": Array(jobs.values)
+        ]
+        // Preserve any pendingNativeEvents written by NativeJobEvaluator
+        if let raw = UserDefaults.standard.string(forKey: Self.storageKey),
+           let data = raw.data(using: .utf8),
+           let existing = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let pending = existing["pendingNativeEvents"] as? [[String: Any]],
+           !pending.isEmpty {
+            state["pendingNativeEvents"] = pending
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: state),
+              let raw = String(data: data, encoding: .utf8) else { return }
+        UserDefaults.standard.set(raw, forKey: Self.storageKey)
+    }
+
+    // ── Background wake ───────────────────────────────────────────────────────
+
+    /// Read pendingNativeEvents from storage, emit each as jobDue, then clear them.
+    private func firePendingNativeEvents() {
+        guard let raw = UserDefaults.standard.string(forKey: Self.storageKey),
+              let data = raw.data(using: .utf8),
+              var state = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return
+        }
+
+        // Sync native-evaluated job fields (nextDueAt, lastFiredAt, consecutiveSkips) into memory.
+        if let jobsArr = state["jobs"] as? [[String: Any]] {
+            for nativeJob in jobsArr {
+                if let id = nativeJob["id"] as? String, !id.isEmpty, jobs[id] != nil {
+                    jobs[id] = nativeJob
+                }
+            }
+        }
+
+        guard let pending = state["pendingNativeEvents"] as? [[String: Any]], !pending.isEmpty else {
+            return
+        }
+
+        for evt in pending {
+            notifyListeners("jobDue", data: evt)
+        }
+
+        // Clear pendingNativeEvents and write back updated jobs.
+        state.removeValue(forKey: "pendingNativeEvents")
+        state["jobs"] = Array(jobs.values)
+        if let newData = try? JSONSerialization.data(withJSONObject: state),
+           let newRaw = String(data: newData, encoding: .utf8) {
+            UserDefaults.standard.set(newRaw, forKey: Self.storageKey)
+        }
+    }
+
+    // ── Plugin methods ────────────────────────────────────────────────────────
 
     @objc func register(_ call: CAPPluginCall) {
         guard let name = call.getString("name")?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else {
@@ -58,6 +155,7 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         if let data = call.getObject("data") { record["data"] = data }
 
         jobs[id] = record
+        saveState()
         notifyListeners("statusChanged", data: buildStatus())
         call.resolve(["id": id])
     }
@@ -68,6 +166,7 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
         jobs.removeValue(forKey: id)
+        saveState()
         notifyListeners("statusChanged", data: buildStatus())
         call.resolve()
     }
@@ -91,6 +190,7 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         if call.options.keys.contains("data") { existing["data"] = call.getObject("data") }
 
         jobs[id] = existing
+        saveState()
         notifyListeners("statusChanged", data: buildStatus())
         call.resolve()
     }
@@ -124,12 +224,14 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func pauseAll(_ call: CAPPluginCall) {
         paused = true
+        saveState()
         notifyListeners("statusChanged", data: buildStatus())
         call.resolve()
     }
 
     @objc func resumeAll(_ call: CAPPluginCall) {
         paused = false
+        saveState()
         notifyListeners("statusChanged", data: buildStatus())
         call.resolve()
     }
@@ -144,12 +246,21 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
             bgManager.scheduleRefresh()
             bgManager.scheduleProcessing(requiresExternalPower: mode != "aggressive")
         }
+        saveState()
         notifyListeners("statusChanged", data: buildStatus())
         call.resolve()
     }
 
     @objc func getStatus(_ call: CAPPluginCall) {
         call.resolve(buildStatus())
+    }
+
+    /// E2E test hook: directly calls NativeJobEvaluator.evaluate() and fires pending events.
+    /// Used to test native background evaluation without BGTaskScheduler.
+    @objc func __testNativeEvaluate(_ call: CAPPluginCall) {
+        let events = NativeJobEvaluator.evaluate(source: "test_trigger")
+        firePendingNativeEvents()
+        call.resolve(["firedCount": events.count])
     }
 
     private func buildStatus() -> [String: Any] {
