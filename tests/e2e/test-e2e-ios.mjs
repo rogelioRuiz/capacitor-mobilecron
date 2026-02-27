@@ -116,9 +116,15 @@ function startServer(udid) {
         res.end(JSON.stringify({ ok: true }))
         // Terminate and relaunch asynchronously
         setImmediate(async () => {
-          terminateApp(udid)
-          await sleep(delay)
-          launchApp(udid)
+          try {
+            terminateApp(udid)
+            await sleep(delay)
+            console.log('  → Relaunching app...')
+            launchApp(udid)
+            console.log('  → App relaunched OK')
+          } catch (err) {
+            console.error('  → Relaunch FAILED:', err.message)
+          }
         })
         return
       }
