@@ -267,17 +267,19 @@ async function main() {
       console.log(`  → cap sync skipped: ${(e.stderr || e.message || '').split('\n')[0]}`)
     }
 
+    const derivedDataPath = '/tmp/mobilecron-e2e-dd'
     console.log('  → Building with xcodebuild...')
     execSync(
       `xcodebuild -workspace App.xcworkspace -scheme App -sdk iphonesimulator ` +
-      `-destination "platform=iOS Simulator,id=${udid}" -configuration Debug build ` +
+      `-destination "platform=iOS Simulator,id=${udid}" -configuration Debug ` +
+      `-derivedDataPath ${derivedDataPath} build ` +
       `CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO`,
       { cwd: iosDir, encoding: 'utf8', timeout: 300000, stdio: ['ignore', 'pipe', 'pipe'] }
     )
 
     console.log('  → Installing app...')
     const appPath = execSync(
-      `find ~/Library/Developer/Xcode/DerivedData -name "App.app" ` +
+      `find ${derivedDataPath} -name "App.app" ` +
       `-path "*/Debug-iphonesimulator/*" -not -path "*PlugIns*" 2>/dev/null | head -1`,
       { encoding: 'utf8', shell: true }
     ).trim()
