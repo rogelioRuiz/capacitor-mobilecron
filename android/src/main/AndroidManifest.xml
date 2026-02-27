@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="io.mobilecron">
+    <application>
+        <!-- Receiver is dynamically registered in phase 1; manifest entry not required. -->
+    </application>
+</manifest>

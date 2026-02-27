@@ -1,0 +1,84 @@
+{
+  "name": "capacitor-mobilecron",
+  "version": "0.1.0",
+  "description": "Capacitor scheduling primitive that emits job due events across web, Android, and iOS",
+  "main": "dist/esm/index.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "capacitor": {
+    "android": {
+      "src": "android"
+    },
+    "ios": {
+      "src": "ios"
+    }
+  },
+  "files": [
+    "android/src",
+    "android/build.gradle",
+    "android/proguard-rules.pro",
+    "ios",
+    "dist",
+    "src",
+    "package.json",
+    "README.md"
+  ],
+  "author": "Rogelio Ruiz",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rogelioRuiz/capacitor-mobilecron.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rogelioRuiz/capacitor-mobilecron/issues"
+  },
+  "homepage": "https://github.com/rogelioRuiz/capacitor-mobilecron#readme",
+  "keywords": [
+    "capacitor",
+    "plugin",
+    "scheduler",
+    "cron",
+    "mobile",
+    "background",
+    "jobs",
+    "android",
+    "ios"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:watch": "tsc -p tsconfig.json --watch",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "npx biome check .",
+    "lint:fix": "npx biome check --write .",
+    "format": "npx biome format --write .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "node tests/e2e/test-e2e.mjs",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "@capacitor/core": ">=6.0.0",
+    "@capacitor/preferences": ">=6.0.0",
+    "@capacitor/app": ">=6.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@capacitor/app": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@capacitor/app": "^6.0.0",
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/preferences": "^6.0.0",
+    "@vitest/coverage-v8": "^3.2.4",
+    "happy-dom": "^17.5.5",
+    "typescript": "^5.6.3",
+    "vitest": "^3.2.4"
+  }
+}
