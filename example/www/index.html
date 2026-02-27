@@ -200,6 +200,8 @@
     // ─── PHASE DETECTION ─────────────────────────────────────────────────────
     const phase = localStorage.getItem('mcron_phase') || 'phase1'
     setStatus('Running phase: ' + phase)
+    // Log phase to HTTP server for debugging
+    await postResult('PHASE: ' + phase, 'pass', 'cycle=' + (localStorage.getItem('mcron_cycle_num') || 'n/a'))
 
     // ════════════════════════════════════════════════════════════════════════
     // PHASE 1: Sections 1, 3, 4, 5 — pure API tests
