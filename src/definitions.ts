@@ -16,6 +16,7 @@ export interface MobileCronPlugin {
   addListener(event: 'jobSkipped', handler: (data: JobSkippedEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'overdueJobs', handler: (data: OverdueEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'statusChanged', handler: (data: CronStatus) => void): Promise<PluginListenerHandle>
+  addListener(event: 'nativeWake', handler: (data: { source: WakeSource; paused?: boolean }) => void): Promise<PluginListenerHandle>
 }
 
 export interface CronJobOptions {
@@ -68,14 +69,6 @@ export interface CronStatus {
   }
 }
 
-export interface JobDueEvent {
-  id: string
-  name: string
-  firedAt: number
-  source: WakeSource
-  data?: Record<string, unknown>
-}
-
 export type WakeSource =
   | 'watchdog'
   | 'workmanager'
@@ -86,6 +79,16 @@ export type WakeSource =
   | 'bgtask_processing'
   | 'bgtask_continued'
   | 'manual'
+
+export type NativeFiredEvent = {
+  id: string
+  name: string
+  firedAt: number
+  source: WakeSource
+  data?: Record<string, unknown>
+}
+
+export type JobDueEvent = NativeFiredEvent
 
 export interface JobSkippedEvent {
   id: string

@@ -29,16 +29,17 @@ function httpGetJSON(url) {
 
 // ── Setup CDP forward ────────────────────────────────────────────────────
 
-const pid = execSync(`${ADB} shell pidof io.mobileclaw.reference`, { encoding: 'utf-8' }).trim();
-if (!pid) { console.error('App not running'); process.exit(1); }
+const APP_PACKAGE = 'io.mobilecron.test';
+const pid = execSync(`${ADB} shell pidof ${APP_PACKAGE}`, { encoding: 'utf-8' }).trim();
+if (!pid) { console.error(`App ${APP_PACKAGE} not running`); process.exit(1); }
 execSync(`${ADB} forward tcp:${CDP_PORT} localabstract:webview_devtools_remote_${pid}`);
 
 // ── Discover target ──────────────────────────────────────────────────────
 
 await new Promise(r => setTimeout(r, 1000)); // wait for CDP to be ready
 const targets = await httpGetJSON(`http://localhost:${CDP_PORT}/json`);
-const target = targets.find(t => t.url.includes('/cron-test'));
-if (!target) { console.error('No /cron-test target found. Current URLs:', targets.map(t => t.url)); process.exit(1); }
+const target = targets[0]; // dedicated test app — use the first (and only) WebView page
+if (!target) { console.error('No WebView target found in', APP_PACKAGE); process.exit(1); }
 
 // ── CDP connection ───────────────────────────────────────────────────────
 
@@ -93,11 +94,11 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 async function bgAndFg(bgMs = 3000) {
   adb('shell', 'input', 'keyevent', '3');
   await sleep(bgMs);
-  adb('shell', 'am', 'start', '-n', 'io.mobileclaw.reference/.MainActivity');
+  adb('shell', 'am', 'start', '-n', 'io.mobilecron.test/.MainActivity');
   await sleep(3000);
   // Re-forward CDP in case it dropped
   try {
-    const p = adb('shell', 'pidof', 'io.mobileclaw.reference');
+    const p = adb('shell', 'pidof', 'io.mobilecron.test');
     adb('forward', `tcp:${CDP_PORT}`, `localabstract:webview_devtools_remote_${p}`);
   } catch { /* best effort */ }
 }
@@ -797,9 +798,9 @@ async function realWorldTests() {
     // Open Settings app (different app), then come back
     adb('shell', 'am', 'start', '-a', 'android.settings.SETTINGS');
     await sleep(3000);
-    adb('shell', 'am', 'start', '-n', 'io.mobileclaw.reference/.MainActivity');
+    adb('shell', 'am', 'start', '-n', 'io.mobilecron.test/.MainActivity');
     await sleep(3000);
-    try { const p = adb('shell', 'pidof', 'io.mobileclaw.reference'); adb('forward', `tcp:${CDP_PORT}`, `localabstract:webview_devtools_remote_${p}`); } catch {}
+    try { const p = adb('shell', 'pidof', 'io.mobilecron.test'); adb('forward', `tcp:${CDP_PORT}`, `localabstract:webview_devtools_remote_${p}`); } catch {}
 
     const { jobs } = await evalJSON(`window.Capacitor.Plugins.MobileCron.list()`);
     assertEqual(jobs.length, 1, 'Job should survive app switch');
@@ -840,7 +841,7 @@ async function nativeWakeTests() {
   await test('7.1 WorkManager is registered in Android JobScheduler', async () => {
     const dump = adb('shell', 'dumpsys', 'jobscheduler');
     const wmJobs = dump.split('\n').filter(l =>
-      l.includes('io.mobileclaw.reference') && l.includes('SystemJobService')
+      l.includes('io.mobilecron.test') && l.includes('SystemJobService')
     );
     assert(wmJobs.length >= 1, `Should have WorkManager jobs registered, found ${wmJobs.length}`);
   });
@@ -882,10 +883,266 @@ async function nativeWakeTests() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// SECTION 8: Native Background Execution
+// ══════════════════════════════════════════════════════════════════════════
+
+// Read mobilecron:state directly from the Capacitor Preferences bridge (native SharedPreferences)
+async function readStoredState() {
+  const raw = await evaluate(`(async () => {
+    const r = await window.Capacitor.Plugins.Preferences.get({ key: 'mobilecron:state' });
+    return r.value;
+  })()`);
+  return raw ? JSON.parse(raw) : null;
+}
+
+// Write mobilecron:state directly through the Capacitor Preferences bridge
+async function writeStoredState(state) {
+  const escaped = JSON.stringify(JSON.stringify(state));
+  await evaluate(`(async () => {
+    await window.Capacitor.Plugins.Preferences.set({ key: 'mobilecron:state', value: ${escaped} });
+  })()`);
+}
+
+// Force-run all WorkManager SystemJobService entries for the app via ADB.
+// Returns the number of job IDs successfully force-triggered.
+function forceWorkManager() {
+  try {
+    const dump = adb('shell', 'dumpsys', 'jobscheduler');
+    const ids = new Set();
+    const lines = dump.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.includes('io.mobilecron.test')) continue;
+      if (!line.includes('SystemJobService') && !line.includes('WorkManager')) continue;
+      const ctx = lines.slice(Math.max(0, i - 3), i + 4).join('\n');
+      for (const m of ctx.matchAll(/(?:JOB\s+#[^\/]+\/|id=)(\d+)/g)) ids.add(m[1]);
+    }
+    let forced = 0;
+    for (const id of ids) {
+      try { adb('shell', 'cmd', 'jobscheduler', 'run', '-f', 'io.mobilecron.test', id); forced++; }
+      catch { /* skip individual failures */ }
+    }
+    return forced;
+  } catch { return 0; }
+}
+
+// Re-establish CDP forward after a bg/fg cycle that may have reset the PID
+function reforwardCdp() {
+  try {
+    const p = adb('shell', 'pidof', 'io.mobilecron.test');
+    adb('forward', `tcp:${CDP_PORT}`, `localabstract:webview_devtools_remote_${p.trim()}`);
+  } catch { /* best effort */ }
+}
+
+async function nativeBackgroundTests() {
+  console.log('\n══ SECTION 8: Native Background Execution ══');
+
+  // ── 8.1: SharedPreferences key check ─────────────────────────────────────
+  await test('8.1 CAPStorage.xml stores key "mobilecron:state" without group prefix', async () => {
+    await cleanAll();
+    await evaluate(`window.Capacitor.Plugins.MobileCron.register({
+      name: 'key-check', schedule: { kind: 'every', everyMs: 60000 }
+    })`);
+    await sleep(300);
+
+    const xml = adb('shell', 'run-as', 'io.mobilecron.test', 'cat',
+      '/data/data/io.mobilecron.test/shared_prefs/CapacitorStorage.xml');
+    assert(xml.includes('mobilecron:state'),
+      `CapacitorStorage.xml must contain mobilecron:state. Snippet: ${xml.substring(0, 300)}`);
+    assert(!xml.includes('CapacitorStorage.mobilecron'),
+      'Key must be plain "mobilecron:state", not prefixed with "CapacitorStorage."');
+    await cleanAll();
+  });
+
+  // ── 8.2: Pending events injected into storage fire on foreground ──────────
+  await test('8.2 Pending native events in storage deliver as jobDue on foreground (rehydrate path)', async () => {
+    await cleanAll();
+    const { id: jobId } = await evalJSON(`window.Capacitor.Plugins.MobileCron.register({
+      name: 'pending-inject',
+      schedule: { kind: 'every', everyMs: 60000 },
+      data: { sentinel: 'native-e2e' }
+    })`);
+
+    // Inject pendingNativeEvents – simulates exactly what NativeJobEvaluator writes
+    const state = await readStoredState();
+    assert(state?.jobs?.length > 0, 'Need jobs in stored state');
+    state.pendingNativeEvents = [{
+      id: jobId,
+      name: 'pending-inject',
+      firedAt: Date.now() - 2000,
+      source: 'workmanager',
+      data: { sentinel: 'native-e2e' }
+    }];
+    // Advance nextDueAt so TS watchdog doesn't re-fire on foreground
+    const j = state.jobs.find(j => j.id === jobId);
+    if (j) { j.lastFiredAt = Date.now() - 2000; j.nextDueAt = Date.now() + 58000; }
+    await writeStoredState(state);
+
+    // Register JS listener before going to background
+    await evaluate(`
+      window.__pendingFired = [];
+      window.Capacitor.Plugins.MobileCron.addListener('jobDue', (e) => {
+        window.__pendingFired.push({ id: e.id, source: e.source });
+      });
+    `);
+
+    // background → foreground triggers appStateChange → rehydrate()
+    await bgAndFg(3000);
+    await sleep(500);
+
+    const fired = await evalJSON(`Promise.resolve(window.__pendingFired || [])`);
+    const match = fired.find(e => e.id === jobId && e.source === 'workmanager');
+    assert(match, `pendingNativeEvents must deliver jobDue on foreground (fired: ${JSON.stringify(fired)})`);
+
+    // Storage must be cleared after rehydrate
+    const afterState = await readStoredState();
+    assertEqual((afterState?.pendingNativeEvents ?? []).length, 0,
+      'pendingNativeEvents must be cleared after rehydrate');
+
+    await cleanAll();
+  }, 35000);
+
+  // ── 8.3: NativeJobEvaluator fires due job via forced WorkManager ──────────
+  await test('8.3 NativeJobEvaluator fires due job in background and delivers via rehydrate', async () => {
+    await cleanAll();
+    const { id: jobId } = await evalJSON(`window.Capacitor.Plugins.MobileCron.register({
+      name: 'native-eval-bg',
+      schedule: { kind: 'every', everyMs: 60000 }
+    })`);
+
+    // Write a past nextDueAt so NativeJobEvaluator considers it due
+    const state = await readStoredState();
+    const j = state?.jobs?.find(j => j.id === jobId);
+    assert(j, 'Job must be in stored state');
+    j.nextDueAt = Date.now() - 10000; // 10 s overdue
+    await writeStoredState(state);
+
+    await evaluate(`
+      window.__nativeBgFired = [];
+      window.Capacitor.Plugins.MobileCron.addListener('jobDue', (e) => {
+        window.__nativeBgFired.push({ id: e.id, source: e.source });
+      });
+    `);
+
+    // Background app
+    adb('shell', 'input', 'keyevent', '3');
+    await sleep(1500);
+
+    // Force WorkManager job(s) – this runs NativeJobEvaluator
+    const forced = forceWorkManager();
+    assert(forced > 0, `Must force ≥1 WorkManager job (found ${forced}). Check dumpsys jobscheduler.`);
+    console.log(`    (forced ${forced} WorkManager job(s))`);
+    await sleep(4000); // Wait for native evaluation + storage write
+
+    // Foreground
+    adb('shell', 'am', 'start', '-n', 'io.mobilecron.test/.MainActivity');
+    await sleep(3000);
+    reforwardCdp();
+    await sleep(500);
+
+    const fired = await evalJSON(`Promise.resolve(window.__nativeBgFired || [])`);
+    const nativeFires = fired.filter(e =>
+      e.id === jobId && ['workmanager', 'workmanager_chain'].includes(e.source));
+    assert(nativeFires.length >= 1,
+      `NativeJobEvaluator should fire due job (got: ${JSON.stringify(fired)})`);
+
+    await cleanAll();
+  }, 60000);
+
+  // ── 8.4: NativeJobEvaluator skips when paused ────────────────────────────
+  await test('8.4 NativeJobEvaluator skips due jobs when scheduler is paused', async () => {
+    await cleanAll();
+    await evaluate(`window.Capacitor.Plugins.MobileCron.pauseAll()`);
+
+    const { id: jobId } = await evalJSON(`window.Capacitor.Plugins.MobileCron.register({
+      name: 'paused-native',
+      schedule: { kind: 'every', everyMs: 60000 }
+    })`);
+
+    const state = await readStoredState();
+    assert(state?.paused === true, 'State must be paused');
+    const j = state.jobs.find(j => j.id === jobId);
+    j.nextDueAt = Date.now() - 10000;
+    await writeStoredState(state);
+
+    await evaluate(`
+      window.__pausedFired = [];
+      window.Capacitor.Plugins.MobileCron.addListener('jobDue', (e) => { window.__pausedFired.push(e.id); });
+    `);
+
+    adb('shell', 'input', 'keyevent', '3');
+    await sleep(1500);
+    const forced = forceWorkManager();
+    console.log(`    (forced ${forced} WorkManager job(s) while paused)`);
+    await sleep(4000);
+
+    adb('shell', 'am', 'start', '-n', 'io.mobilecron.test/.MainActivity');
+    await sleep(3000);
+    reforwardCdp();
+    await sleep(500);
+
+    const fired = await evalJSON(`Promise.resolve(window.__pausedFired || [])`);
+    assert(!fired.includes(jobId),
+      `Paused job must NOT fire (fired: ${JSON.stringify(fired)})`);
+
+    // consecutiveSkips must be incremented by the skip
+    const afterState = await readStoredState();
+    const afterJob = afterState?.jobs?.find(j => j.id === jobId);
+    assert((afterJob?.consecutiveSkips ?? 0) > 0,
+      `consecutiveSkips should be >0 after skip (got ${afterJob?.consecutiveSkips})`);
+
+    await evaluate(`window.Capacitor.Plugins.MobileCron.resumeAll()`);
+    await cleanAll();
+  }, 60000);
+
+  // ── 8.5: No double-fire – nextDueAt advances after native evaluation ──────
+  await test('8.5 nextDueAt advances after native evaluation — job fires exactly once', async () => {
+    await cleanAll();
+    const { id: jobId } = await evalJSON(`window.Capacitor.Plugins.MobileCron.register({
+      name: 'dedup-test',
+      schedule: { kind: 'every', everyMs: 60000 }
+    })`);
+
+    const state = await readStoredState();
+    const j = state?.jobs?.find(j => j.id === jobId);
+    j.nextDueAt = Date.now() - 5000;
+    await writeStoredState(state);
+
+    await evaluate(`
+      window.__dedupFired = [];
+      window.Capacitor.Plugins.MobileCron.addListener('jobDue', (e) => { window.__dedupFired.push(e.id); });
+    `);
+
+    adb('shell', 'input', 'keyevent', '3');
+    await sleep(1500);
+    const forced = forceWorkManager();
+    assert(forced > 0, `Must force ≥1 WorkManager job (found ${forced})`);
+    await sleep(4000);
+
+    adb('shell', 'am', 'start', '-n', 'io.mobilecron.test/.MainActivity');
+    await sleep(3000);
+    reforwardCdp();
+    await sleep(500);
+
+    const fired = await evalJSON(`Promise.resolve(window.__dedupFired || [])`);
+    const count = fired.filter(id => id === jobId).length;
+    assertEqual(count, 1, `Job should fire exactly once, not be duplicated (fired ${count}×)`);
+
+    // nextDueAt must be in the future (advanced by NativeJobEvaluator)
+    const { jobs } = await evalJSON(`window.Capacitor.Plugins.MobileCron.list()`);
+    const afterJob = jobs.find(j => j.id === jobId);
+    assert((afterJob?.nextDueAt ?? 0) > Date.now(),
+      `nextDueAt must be future after native fire (got ${afterJob?.nextDueAt})`);
+
+    await cleanAll();
+  }, 60000);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 
 function getPid() {
   try {
-    const ps = adb('shell', 'pidof', 'io.mobileclaw.reference');
+    const ps = adb('shell', 'pidof', 'io.mobilecron.test');
     return parseInt(ps.trim(), 10) || 0;
   } catch { return 0; }
 }
@@ -914,6 +1171,7 @@ ws.on('open', async () => {
     await modeTests();
     await realWorldTests();
     await nativeWakeTests();
+    await nativeBackgroundTests();
   } catch (e) {
     console.error('\nFATAL:', e.message);
   }

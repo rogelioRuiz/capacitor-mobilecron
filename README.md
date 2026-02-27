@@ -1,6 +1,6 @@
 # capacitor-mobilecron
 
-> Lightweight Capacitor scheduling primitive — register jobs, get `jobDue` events when they fire, across web, Android, and iOS.
+> Lightweight Capacitor scheduling primitive — register jobs, get `jobDue` events when they fire, across web, Android (WorkManager), and iOS (BGTaskScheduler). Jobs evaluate natively even when the WebView is suspended.
 
 [![npm version](https://img.shields.io/npm/v/capacitor-mobilecron)](https://www.npmjs.com/package/capacitor-mobilecron)
 [![CI](https://github.com/rogelioRuiz/capacitor-mobilecron/actions/workflows/ci.yml/badge.svg)](https://github.com/rogelioRuiz/capacitor-mobilecron/actions/workflows/ci.yml)
@@ -14,11 +14,9 @@
 - **One-shot schedules** (`at: epoch ms`) that auto-disable after firing
 - **Active-hour windows** — restrict jobs to HH:MM–HH:MM ranges with timezone support
 - **Network / charging constraints** — skip a job when connectivity or power is absent
-- **Scheduling modes** — `eco` (60s watchdog), `balanced` (30s), `aggressive` (15s)
-- **App foreground wakeup** — immediately checks overdue jobs when the app comes to the foreground
-- **Persistent state** — job registry survives app restarts via `@capacitor/preferences` (falls back to `localStorage` on web)
-
-The web implementation is fully functional and self-contained. Android and iOS stubs satisfy the Capacitor plugin contract and can be extended with native WorkManager / BGTaskScheduler wakeups.
+- **Scheduling modes** — `eco`, `balanced`, `aggressive` (controls WorkManager cadence)
+- **True native background execution** — Android WorkManager and iOS BGTaskScheduler evaluate due jobs and fire `jobDue` events even when the WebView is suspended
+- **Persistent state** — job registry survives app restarts via `CapacitorStorage` (SharedPreferences on Android, UserDefaults on iOS)
 
 ## Installation
 
@@ -149,13 +147,13 @@ await MobileCron.resumeAll()
 
 ### `setMode({ mode })`
 
-Control how frequently the watchdog timer checks for due jobs.
+Control WorkManager scheduling cadence.
 
-| Mode | Interval | Use case |
-|------|----------|---------|
-| `'eco'` | 60 s | Battery-sensitive background |
-| `'balanced'` | 30 s | Default |
-| `'aggressive'` | 15 s | Real-time UX needs |
+| Mode | WorkManager interval | Use case |
+|------|----------------------|---------|
+| `'eco'` | 15 min, Wi-Fi + battery-not-low | Battery-sensitive background |
+| `'balanced'` | 15 min, network connected | Default |
+| `'aggressive'` | 5 min chain (one-shot repeat) | Real-time needs |
 
 ```typescript
 await MobileCron.setMode({ mode: 'aggressive' })
@@ -172,8 +170,7 @@ const status = await MobileCron.getStatus()
 //   mode: 'balanced',
 //   platform: 'android',
 //   activeJobCount: 3,
-//   nextDueAt: 1719000000000,
-//   android: { workManagerActive: true, chargingReceiverActive: false }
+//   android: { workManagerActive: true, chargingReceiverActive: true }
 // }
 ```
 
@@ -181,21 +178,32 @@ const status = await MobileCron.getStatus()
 
 | Event | Payload | Description |
 |-------|---------|-------------|
-| `jobDue` | `JobDueEvent` | A job fired |
+| `jobDue` | `JobDueEvent` | A job fired (source: `'workmanager'`, `'charging'`, `'manual'`, etc.) |
 | `jobSkipped` | `JobSkippedEvent` | A due job was skipped (constraint not met) |
 | `overdueJobs` | `OverdueEvent` | Emitted on foreground resume if jobs are overdue |
 | `statusChanged` | `CronStatus` | Scheduler state changed |
+| `nativeWake` | `{ source, paused }` | WorkManager or ChargingReceiver woke the plugin |
 
 ```typescript
 MobileCron.addListener('jobSkipped', ({ id, name, reason }) => {
   // reason: 'outside_active_hours' | 'paused' | 'requires_network' | 'requires_charging'
   console.warn(`Job ${name} skipped: ${reason}`)
 })
-
-MobileCron.addListener('overdueJobs', ({ count, jobs }) => {
-  console.warn(`${count} jobs were overdue on resume`)
-})
 ```
+
+## How native background execution works
+
+On Android, `capacitor-mobilecron` registers a **WorkManager** periodic task (every 15 min in `balanced` mode). When it fires — even while the WebView is suspended:
+
+1. `NativeJobEvaluator` reads job state from `CapacitorStorage` (SharedPreferences)
+2. It evaluates which jobs are due, checks active-hour windows and constraints
+3. Fired events are written to `pendingNativeEvents` in storage
+4. `CronBridge` wakes the plugin — if the WebView is alive, `jobDue` events are dispatched immediately
+5. On next app foreground (`handleOnResume`), any remaining pending events are dispatched
+
+A **ChargingReceiver** also triggers evaluation when the device starts charging.
+
+On iOS, `BGAppRefreshTask` and `BGProcessingTask` follow the same pattern via `NativeJobEvaluator.swift`.
 
 ## Advanced: `MobileCronScheduler`
 
@@ -217,24 +225,9 @@ const { id } = await scheduler.register({
   schedule: { kind: 'every', everyMs: 30_000 },
 })
 
-// Later — check due jobs from a native wakeup callback
-scheduler.checkDueJobs('workmanager')
-
 // Teardown
 await scheduler.destroy()
 ```
-
-## iOS / Android native wakeups
-
-The web/JS watchdog is the primary scheduling mechanism. For true background execution extend the native stubs:
-
-### Android
-
-Wire `CronWorker` into `WorkManager` periodic tasks and call `bridge.checkDueJobs("workmanager")`. Register `ChargingReceiver` in the manifest for charging wakeups.
-
-### iOS
-
-Register a `BGAppRefreshTask` / `BGProcessingTask` in your `AppDelegate` and call the plugin method to check due jobs from there.
 
 ## Testing
 
@@ -243,26 +236,32 @@ Register a `BGAppRefreshTask` / `BGProcessingTask` in your `AppDelegate` and cal
 The scheduler core is pure TypeScript and fully testable without a phone:
 
 ```bash
-npm test              # run 52 unit tests (instant)
+npm test              # 56 unit tests (instant)
 npm run test:watch    # TDD watch mode
 npm run test:coverage # coverage report
 ```
 
-Tests cover schedule computation, active-hour windows, persistence, pause/resume, skip logic, and more.
+Tests cover schedule computation, active-hour windows, persistence, pause/resume, skip logic, native event rehydration, and more.
 
 ### Device E2E tests (Android, via CDP)
 
-Full integration suite against a running Android app — 7 sections, 40+ tests:
+Full integration suite against a running Android app — 8 sections, 50 tests:
 
 ```bash
-# 1. Forward CDP port from device
-adb forward tcp:9222 localabstract:webview_devtools_remote_$(adb shell pidof io.mobileclaw.reference)
+# 1. Build and install the example app
+cd example/android && ./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 
-# 2. Run
+# 2. Launch the app
+adb shell am start -n io.mobilecron.test/.MainActivity
+
+# 3. From the project root, run the suite
 npm run test:e2e
 ```
 
-See [`tests/e2e/test-e2e.mjs`](tests/e2e/test-e2e.mjs) for coverage details.
+The suite covers stress tests, background/foreground cycles, event reliability, edge cases, mode switching, real-world scenarios, native wake, and **native background execution** (WorkManager evaluation, `pendingNativeEvents` rehydration, skip logic, dedup).
+
+See [`tests/e2e/test-e2e.mjs`](tests/e2e/test-e2e.mjs) and [`example/`](example/) for details.
 
 ## Contributing
 

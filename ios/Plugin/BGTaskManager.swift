@@ -62,6 +62,7 @@ final class BGTaskManager {
         task.expirationHandler = {
             task.setTaskCompleted(success: false)
         }
+        _ = NativeJobEvaluator.evaluate(source: "bgtask_refresh")
         plugin?.handleBackgroundWake(source: "bgtask_refresh")
         task.setTaskCompleted(success: true)
     }
@@ -72,6 +73,7 @@ final class BGTaskManager {
         task.expirationHandler = {
             task.setTaskCompleted(success: false)
         }
+        _ = NativeJobEvaluator.evaluate(source: "bgtask_processing")
         plugin?.handleBackgroundWake(source: "bgtask_processing")
         task.setTaskCompleted(success: true)
     }

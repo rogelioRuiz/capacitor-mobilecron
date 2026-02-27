@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MobileCron Test</title>
+  <style>
+    body { font-family: monospace; background: #0d0d0d; color: #e0e0e0; padding: 16px; font-size: 14px; }
+    h1 { color: #7c3aed; margin-bottom: 4px; font-size: 18px; }
+    .subtitle { color: #666; margin-bottom: 20px; font-size: 12px; }
+    #status { color: #eab308; margin-bottom: 12px; font-size: 13px; }
+    #plugins { color: #22c55e; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>capacitor-mobilecron</h1>
+  <div class="subtitle">E2E Test App — CDP-driven</div>
+  <div id="status">Waiting for Capacitor bridge...</div>
+  <div id="plugins"></div>
+
+  <script src="capacitor.js"></script>
+  <script>
+    async function waitForBridge() {
+      const statusEl = document.getElementById('status');
+      const pluginsEl = document.getElementById('plugins');
+
+      for (let i = 0; i < 60; i++) {
+        if (window.Capacitor?.Plugins?.MobileCron) {
+          statusEl.textContent = 'Bridge ready ✓';
+          statusEl.style.color = '#22c55e';
+          const plugins = Object.keys(window.Capacitor.Plugins).join(', ');
+          pluginsEl.textContent = 'Plugins: ' + plugins;
+          console.log('__MOBILECRON_BRIDGE_READY__');
+          return;
+        }
+        await new Promise(r => setTimeout(r, 500));
+      }
+
+      statusEl.textContent = 'ERROR: Bridge timeout';
+      statusEl.style.color = '#ef4444';
+      console.error('__MOBILECRON_BRIDGE_TIMEOUT__');
+    }
+
+    window.addEventListener('DOMContentLoaded', waitForBridge);
+  </script>
+</body>
+</html>

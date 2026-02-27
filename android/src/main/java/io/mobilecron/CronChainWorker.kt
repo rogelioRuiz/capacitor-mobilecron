@@ -13,6 +13,7 @@ class CronChainWorker(
     params: WorkerParameters
 ) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result {
+        NativeJobEvaluator.evaluate(applicationContext, "workmanager_chain")
         CronBridge.wake("workmanager_chain")
         enqueueNext(applicationContext, 5)
         return Result.success()

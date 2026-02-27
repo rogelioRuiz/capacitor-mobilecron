@@ -7,6 +7,7 @@ import type {
   CronStatus,
   JobDueEvent,
   JobSkippedEvent,
+  NativeFiredEvent,
   OverdueEvent,
   SchedulingMode,
   WakeSource,
@@ -36,6 +37,7 @@ type PersistedState = {
   paused: boolean
   mode: SchedulingMode
   jobs: CronJobState[]
+  pendingNativeEvents?: NativeFiredEvent[]
 }
 
 type SchedulerHooks = {
@@ -73,6 +75,7 @@ export class MobileCronScheduler {
   private initPromise: Promise<void> | null = null
   private appListenerAttached = false
   private appIsActive = true
+  private pendingNativeEvents: NativeFiredEvent[] = []
 
   constructor(options: MobileCronSchedulerOptions = {}) {
     this.platform = options.platform ?? 'web'
@@ -280,6 +283,20 @@ export class MobileCronScheduler {
     return dueEvents
   }
 
+  async rehydrate(): Promise<void> {
+    await this.load()
+    const pending = this.pendingNativeEvents
+    if (pending.length === 0) return
+
+    this.pendingNativeEvents = []
+    await this.save()
+
+    for (const evt of pending) {
+      this.hooks.onJobDue?.(evt)
+    }
+    this.emitStatusChanged()
+  }
+
   computeNextDueAt(schedule: CronSchedule, nowMs: number): number | undefined {
     if (schedule.kind === 'at') {
       if (typeof schedule.atMs !== 'number') return undefined
@@ -324,6 +341,7 @@ export class MobileCronScheduler {
       paused: this.paused,
       mode: this.mode,
       jobs: Array.from(this.jobs.values()),
+      pendingNativeEvents: this.pendingNativeEvents.length > 0 ? this.pendingNativeEvents : undefined,
     }
     const serialized = JSON.stringify(state)
 
@@ -340,6 +358,8 @@ export class MobileCronScheduler {
   }
 
   async load(): Promise<void> {
+    this.pendingNativeEvents = []
+
     let raw: string | null = null
     try {
       const result = await Preferences.get({ key: this.storageKey })
@@ -364,6 +384,7 @@ export class MobileCronScheduler {
     this.paused = parsed.paused ?? false
     this.mode = parsed.mode ?? 'balanced'
     this.jobs.clear()
+    this.pendingNativeEvents = this.normalizePendingNativeEvents(parsed.pendingNativeEvents)
 
     const now = Date.now()
     for (const job of parsed.jobs ?? []) {
@@ -548,6 +569,35 @@ export class MobileCronScheduler {
     }
   }
 
+  private normalizePendingNativeEvents(events: unknown): NativeFiredEvent[] {
+    if (!Array.isArray(events)) return []
+
+    const normalized: NativeFiredEvent[] = []
+    for (const item of events) {
+      if (!item || typeof item !== 'object') continue
+      const evt = item as Record<string, unknown>
+      if (typeof evt.id !== 'string' || typeof evt.name !== 'string' || typeof evt.source !== 'string') continue
+
+      const firedAt = Number(evt.firedAt)
+      if (!Number.isFinite(firedAt)) continue
+
+      const data =
+        evt.data && typeof evt.data === 'object' && !Array.isArray(evt.data)
+          ? (evt.data as Record<string, unknown>)
+          : undefined
+
+      normalized.push({
+        id: evt.id,
+        name: evt.name,
+        firedAt,
+        source: evt.source as WakeSource,
+        data,
+      })
+    }
+
+    return normalized
+  }
+
   private createId(): string {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
       return crypto.randomUUID()
@@ -580,10 +630,15 @@ export class MobileCronScheduler {
 
     try {
       const mod = await import('@capacitor/app')
-      await mod.App.addListener('appStateChange', ({ isActive }) => {
+      await mod.App.addListener('appStateChange', async ({ isActive }) => {
         this.appIsActive = isActive
         if (isActive) {
           this.startWatchdogIfNeeded()
+          try {
+            await this.rehydrate()
+          } catch {
+            // If storage rehydrate fails, still run foreground due-check.
+          }
           this.checkDueJobs('foreground')
         } else if (this.watchdogTimer) {
           clearInterval(this.watchdogTimer)

@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { Preferences } from '@capacitor/preferences'
 import { MobileCronScheduler } from '../../src/mobilecron'
 
 // Each test uses a fresh isolated scheduler backed by an in-memory localStorage
-// (happy-dom provides localStorage; @capacitor/preferences throws → fallback kicks in)
+// (happy-dom provides localStorage; @capacitor/preferences web impl uses
+// "CapacitorStorage." prefix, so tests that simulate native storage writes
+// must go through Preferences.set/get rather than raw localStorage)
 
 describe('computeNextDueAt', () => {
   const s = new MobileCronScheduler()
@@ -406,6 +409,121 @@ describe('getStatus', () => {
     expect(st.ios?.bgRefreshRegistered).toBe(true)
     expect(st.android).toBeUndefined()
     await si.destroy()
+  })
+})
+
+describe('rehydrate', () => {
+  const storageKey = 'mobilecron:state'
+
+  const baseState = (now: number) => ({
+    version: 1,
+    paused: false,
+    mode: 'balanced' as const,
+    jobs: [
+      {
+        id: 'job-native-1',
+        name: 'native-job',
+        enabled: true,
+        schedule: { kind: 'every', everyMs: 60_000, anchorMs: now - 120_000 },
+        requiresNetwork: false,
+        requiresCharging: false,
+        priority: 'normal' as const,
+        data: { from: 'native' },
+        lastFiredAt: now - 60_000,
+        nextDueAt: now + 60_000,
+        consecutiveSkips: 0,
+        createdAt: now - 300_000,
+        updatedAt: now - 60_000,
+      },
+    ],
+    pendingNativeEvents: [
+      {
+        id: 'job-native-1',
+        name: 'native-job',
+        firedAt: now - 1_000,
+        source: 'workmanager',
+        data: { from: 'native' },
+      },
+    ],
+  })
+
+  beforeEach(async () => {
+    localStorage.clear()
+  })
+
+  it('fires pendingNativeEvents from storage on rehydrate()', async () => {
+    const now = Date.now()
+    await Preferences.set({ key: storageKey, value: JSON.stringify(baseState(now)) })
+    const fired: string[] = []
+
+    const s = new MobileCronScheduler({ platform: 'web', onJobDue: (event) => fired.push(event.id) })
+    await s.init()
+    expect(fired).toHaveLength(0)
+
+    await s.rehydrate()
+    expect(fired).toEqual(['job-native-1'])
+    await s.destroy()
+  })
+
+  it('clears pendingNativeEvents from storage after rehydrate()', async () => {
+    const now = Date.now()
+    await Preferences.set({ key: storageKey, value: JSON.stringify(baseState(now)) })
+    const s = new MobileCronScheduler({ platform: 'web' })
+    await s.init()
+
+    await s.rehydrate()
+
+    const { value } = await Preferences.get({ key: storageKey })
+    const saved = JSON.parse(value ?? '{}') as { pendingNativeEvents?: Array<unknown> }
+    expect((saved.pendingNativeEvents ?? []).length).toBe(0)
+    await s.destroy()
+  })
+
+  it('refreshes stale in-memory nextDueAt from storage during rehydrate()', async () => {
+    const s = new MobileCronScheduler({ platform: 'web' })
+    await s.init()
+    const { id } = await s.register({ name: 'rehydrate-next', schedule: { kind: 'every', everyMs: 60_000 } })
+    const before = await s.list()
+    const current = before.jobs.find((job) => job.id === id)
+    expect(current).toBeDefined()
+
+    const bumpedNextDueAt = (current?.nextDueAt ?? Date.now()) + 300_000
+    const { value: savedRaw } = await Preferences.get({ key: storageKey })
+    const parsed = JSON.parse(savedRaw ?? '{}') as { jobs?: Array<{ id: string; nextDueAt?: number }> }
+    const target = parsed.jobs?.find((job) => job.id === id)
+    expect(target).toBeDefined()
+    if (target) target.nextDueAt = bumpedNextDueAt
+    await Preferences.set({ key: storageKey, value: JSON.stringify(parsed) })
+
+    await s.rehydrate()
+    const after = await s.list()
+    expect(after.jobs.find((job) => job.id === id)?.nextDueAt).toBe(bumpedNextDueAt)
+    await s.destroy()
+  })
+
+  it('is idempotent across repeated rehydrate() calls', async () => {
+    const now = Date.now()
+    await Preferences.set({ key: storageKey, value: JSON.stringify(baseState(now)) })
+    const fired: string[] = []
+    let pendingAtCallbackLength = -1
+
+    const s = new MobileCronScheduler({
+      platform: 'web',
+      onJobDue: async (event) => {
+        fired.push(event.id)
+        const { value } = await Preferences.get({ key: storageKey })
+        const saved = JSON.parse(value ?? '{}') as { pendingNativeEvents?: Array<unknown> }
+        pendingAtCallbackLength = (saved.pendingNativeEvents ?? []).length
+      },
+    })
+    await s.init()
+
+    await s.rehydrate()
+    await s.rehydrate()
+
+    expect(fired).toEqual(['job-native-1'])
+    expect(pendingAtCallbackLength).toBe(0)
+    await s.destroy()
   })
 })
 

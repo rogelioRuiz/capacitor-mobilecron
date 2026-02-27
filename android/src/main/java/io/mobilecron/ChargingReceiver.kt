@@ -6,8 +6,10 @@ import android.content.Intent
 
 class ChargingReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
-        if (intent?.action == Intent.ACTION_POWER_CONNECTED) {
-            CronBridge.wake("charging")
-        }
+        val appContext = context ?: return
+        if (intent?.action != Intent.ACTION_POWER_CONNECTED) return
+
+        NativeJobEvaluator.evaluate(appContext, "charging")
+        CronBridge.wake("charging")
     }
 }

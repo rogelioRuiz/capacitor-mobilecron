@@ -9,6 +9,7 @@ class CronWorker(
     params: WorkerParameters
 ) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result {
+        NativeJobEvaluator.evaluate(applicationContext, "workmanager")
         CronBridge.wake("workmanager")
         return Result.success()
     }

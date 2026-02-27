@@ -1,0 +1,21 @@
+{
+  "name": "capacitor-mobilecron-example",
+  "version": "1.0.0",
+  "private": true,
+  "description": "E2E test app for capacitor-mobilecron plugin",
+  "scripts": {
+    "sync": "cap sync",
+    "android": "cap run android",
+    "build:apk": "cd android && ./gradlew assembleDebug"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.0.0",
+    "@capacitor/app": "^6.0.0",
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/preferences": "^6.0.0",
+    "capacitor-mobilecron": "file:.."
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.0.0"
+  }
+}

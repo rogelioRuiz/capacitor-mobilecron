@@ -1,0 +1,9 @@
+{
+  "appId": "io.mobilecron.test",
+  "appName": "MobileCron Test",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": true
+  },
+  "loggingBehavior": "debug"
+}
