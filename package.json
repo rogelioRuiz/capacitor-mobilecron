@@ -20,6 +20,7 @@
     "ios",
     "dist",
     "src",
+    "CapacitorMobilecron.podspec",
     "package.json",
     "README.md"
   ],
@@ -59,6 +60,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:e2e": "node tests/e2e/test-e2e.mjs",
+    "test:e2e:ios": "node tests/e2e/test-e2e-ios.mjs",
     "prepack": "npm run build"
   },
   "peerDependencies": {
