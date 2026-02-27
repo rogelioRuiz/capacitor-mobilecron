@@ -12,8 +12,41 @@ final class NativeJobEvaluator {
     private static let storageKey = "mobilecron:state"
     private static let clockRegex = try? NSRegularExpression(pattern: #"^(\d{2}):(\d{2})$"#)
 
+    // ── Shared I/O ─────────────────────────────────────────────────────────────
+
+    /// JSON file in Application Support — survives simctl terminate (synchronous atomic write).
+    static var stateFileURL: URL? {
+        guard let dir = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ) else { return nil }
+        return dir.appendingPathComponent("mobilecron-state.json")
+    }
+
+    /// Reads raw JSON: file preferred (reliable); UserDefaults as fallback.
+    static func readStateRaw() -> String? {
+        if let url = stateFileURL,
+           let raw = try? String(contentsOf: url, encoding: .utf8),
+           !raw.isEmpty {
+            return raw
+        }
+        return UserDefaults.standard.string(forKey: storageKey)
+    }
+
+    /// Writes raw JSON atomically to file AND to UserDefaults (belt-and-suspenders).
+    static func writeStateRaw(_ raw: String) {
+        if let url = stateFileURL {
+            try? raw.write(to: url, atomically: true, encoding: .utf8)
+        }
+        UserDefaults.standard.set(raw, forKey: storageKey)
+    }
+
+    // ── Evaluation ─────────────────────────────────────────────────────────────
+
     static func evaluate(source: String) -> [NativeJobEvent] {
-        guard let raw = UserDefaults.standard.string(forKey: storageKey),
+        guard let raw = readStateRaw(),
               let data = raw.data(using: .utf8),
               var state = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return []
@@ -101,8 +134,8 @@ final class NativeJobEvaluator {
             }
 
             if let nextData = try? JSONSerialization.data(withJSONObject: state),
-               let nextRaw = String(data: nextData, encoding: .utf8) {
-                UserDefaults.standard.set(nextRaw, forKey: storageKey)
+               let nextRaw = String(nextData, encoding: .utf8) {
+                writeStateRaw(nextRaw)
             }
         }
 

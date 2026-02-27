@@ -22,8 +22,6 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "testGetPendingCount", returnType: CAPPluginReturnPromise)
     ]
 
-    private static let storageKey = "mobilecron:state"
-
     private var jobs: [String: [String: Any]] = [:]
     private var paused = false
     private(set) var mode = "balanced"
@@ -60,9 +58,11 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     // ── Persistence ───────────────────────────────────────────────────────────
+    // Uses NativeJobEvaluator.readStateRaw() / writeStateRaw() for file-backed
+    // atomic writes that survive simctl terminate (SIGKILL) reliably.
 
     private func loadState() {
-        guard let raw = UserDefaults.standard.string(forKey: Self.storageKey),
+        guard let raw = NativeJobEvaluator.readStateRaw(),
               let data = raw.data(using: .utf8),
               let state = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return
@@ -87,7 +87,7 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
             "jobs": Array(jobs.values)
         ]
         // Preserve any pendingNativeEvents written by NativeJobEvaluator
-        if let raw = UserDefaults.standard.string(forKey: Self.storageKey),
+        if let raw = NativeJobEvaluator.readStateRaw(),
            let data = raw.data(using: .utf8),
            let existing = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
            let pending = existing["pendingNativeEvents"] as? [[String: Any]],
@@ -96,16 +96,14 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         }
         guard let data = try? JSONSerialization.data(withJSONObject: state),
               let raw = String(data: data, encoding: .utf8) else { return }
-        UserDefaults.standard.set(raw, forKey: Self.storageKey)
-        // Force immediate disk flush so state survives simctl terminate / force-kill
-        UserDefaults.standard.synchronize()
+        NativeJobEvaluator.writeStateRaw(raw)
     }
 
     // ── Background wake ───────────────────────────────────────────────────────
 
     /// Read pendingNativeEvents from storage, emit each as jobDue, then clear them.
     private func firePendingNativeEvents() {
-        guard let raw = UserDefaults.standard.string(forKey: Self.storageKey),
+        guard let raw = NativeJobEvaluator.readStateRaw(),
               let data = raw.data(using: .utf8),
               var state = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return
@@ -133,8 +131,7 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         state["jobs"] = Array(jobs.values)
         if let newData = try? JSONSerialization.data(withJSONObject: state),
            let newRaw = String(data: newData, encoding: .utf8) {
-            UserDefaults.standard.set(newRaw, forKey: Self.storageKey)
-            UserDefaults.standard.synchronize()
+            NativeJobEvaluator.writeStateRaw(newRaw)
         }
     }
 
@@ -270,8 +267,7 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         call.resolve(["firedCount": events.count])
     }
 
-    /// Sets a job's nextDueAt in memory and saves to UserDefaults.
-    /// Allows tests to mark a job as "due" without waiting for real time to pass.
+    /// Sets a job's nextDueAt in memory and saves to storage.
     @objc func testSetNextDueAt(_ call: CAPPluginCall) {
         guard let id = call.getString("id"),
               let nextDueAtMs = call.getInt("nextDueAtMs"),
@@ -284,17 +280,16 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         call.resolve()
     }
 
-    /// Appends a pending native event to UserDefaults storage.
-    /// Allows tests to simulate what NativeJobEvaluator writes during background execution.
+    /// Appends a pending native event to storage.
     @objc func testInjectPendingEvent(_ call: CAPPluginCall) {
         guard let event = call.getObject("event") else {
             call.reject("event is required")
             return
         }
-        guard let raw = UserDefaults.standard.string(forKey: Self.storageKey),
+        guard let raw = NativeJobEvaluator.readStateRaw(),
               let data = raw.data(using: .utf8),
               var state = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            call.reject("State not found in UserDefaults")
+            call.reject("State not found in storage")
             return
         }
         var pending = (state["pendingNativeEvents"] as? [[String: Any]]) ?? []
@@ -305,14 +300,13 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
             call.reject("Serialization failed")
             return
         }
-        UserDefaults.standard.set(newRaw, forKey: Self.storageKey)
-        UserDefaults.standard.synchronize()
+        NativeJobEvaluator.writeStateRaw(newRaw)
         call.resolve()
     }
 
-    /// Returns the count of pendingNativeEvents currently in UserDefaults storage.
+    /// Returns the count of pendingNativeEvents currently in storage.
     @objc func testGetPendingCount(_ call: CAPPluginCall) {
-        guard let raw = UserDefaults.standard.string(forKey: Self.storageKey),
+        guard let raw = NativeJobEvaluator.readStateRaw(),
               let data = raw.data(using: .utf8),
               let state = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             call.resolve(["count": 0])
