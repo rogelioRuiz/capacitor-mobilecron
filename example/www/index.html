@@ -138,6 +138,17 @@
       return
     }
 
+    // Wrap test hooks that may not be on the Capacitor proxy (they exist natively
+    // but Capacitor may not generate JS stubs for them). Call via nativePromise.
+    const nativeCall = (method, options) =>
+      window.Capacitor.nativePromise('MobileCron', method, options || {})
+
+    // Attach test hooks to MC if missing
+    if (!MC.testNativeEvaluate) MC.testNativeEvaluate = (opts) => nativeCall('testNativeEvaluate', opts)
+    if (!MC.testSetNextDueAt) MC.testSetNextDueAt = (opts) => nativeCall('testSetNextDueAt', opts)
+    if (!MC.testInjectPendingEvent) MC.testInjectPendingEvent = (opts) => nativeCall('testInjectPendingEvent', opts)
+    if (!MC.testGetPendingCount) MC.testGetPendingCount = (opts) => nativeCall('testGetPendingCount', opts)
+
     setStatus('iOS test mode detected — running full E2E suite...')
 
     // ─── Test harness ────────────────────────────────────────────────────────
