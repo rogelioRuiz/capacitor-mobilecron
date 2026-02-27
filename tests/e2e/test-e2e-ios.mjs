@@ -269,10 +269,10 @@ async function main() {
 
     // Touch a marker before build so we can find the NEWLY built App.app afterward.
     execSync('touch /tmp/.mobilecron-build-marker', { shell: true })
-    console.log('  → Building with xcodebuild...')
+    console.log('  → Building with xcodebuild (clean build)...')
     execSync(
       `xcodebuild -workspace App.xcworkspace -scheme App -sdk iphonesimulator ` +
-      `-destination "platform=iOS Simulator,id=${udid}" -configuration Debug build ` +
+      `-destination "platform=iOS Simulator,id=${udid}" -configuration Debug clean build ` +
       `CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO`,
       { cwd: iosDir, encoding: 'utf8', timeout: 300000, stdio: ['ignore', 'pipe', 'pipe'] }
     )
