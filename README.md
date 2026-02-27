@@ -193,17 +193,39 @@ MobileCron.addListener('jobSkipped', ({ id, name, reason }) => {
 
 ## How native background execution works
 
-On Android, `capacitor-mobilecron` registers a **WorkManager** periodic task (every 15 min in `balanced` mode). When it fires — even while the WebView is suspended:
+### Android
+
+`capacitor-mobilecron` registers a **WorkManager** periodic task (every 15 min in `balanced` mode). When it fires — even while the WebView is suspended:
 
 1. `NativeJobEvaluator` reads job state from `CapacitorStorage` (SharedPreferences)
-2. It evaluates which jobs are due, checks active-hour windows and constraints
+2. It evaluates which jobs are due, checks active-hour windows and constraints (`requiresNetwork` via `ConnectivityManager`, `requiresCharging` via `BatteryManager`)
 3. Fired events are written to `pendingNativeEvents` in storage
 4. `CronBridge` wakes the plugin — if the WebView is alive, `jobDue` events are dispatched immediately
 5. On next app foreground (`handleOnResume`), any remaining pending events are dispatched
 
 A **ChargingReceiver** also triggers evaluation when the device starts charging.
 
-On iOS, `BGAppRefreshTask` and `BGProcessingTask` follow the same pattern via `NativeJobEvaluator.swift`.
+### iOS
+
+`BGAppRefreshTask` and `BGProcessingTask` follow the same pattern via `NativeJobEvaluator.swift`. State is persisted to a JSON file in Application Support (with UserDefaults as fallback), ensuring it survives both `SIGKILL` and normal app termination.
+
+### Platform differences and tradeoffs
+
+| Behavior | Android | iOS |
+|----------|---------|-----|
+| **Background wake frequency** | WorkManager ~15 min (`balanced`), ~5 min chain (`aggressive`) | `BGAppRefreshTask` — iOS decides timing (typically 15–30 min, but system-managed) |
+| **`requiresNetwork` constraint** | Checked by `NativeJobEvaluator` at evaluation time via `ConnectivityManager` | **Not checked** at evaluation time — enforced at the `BGProcessingTask` constraint level instead (`requiresNetworkConnectivity`) |
+| **`requiresCharging` constraint** | Checked by `NativeJobEvaluator` at evaluation time via `BatteryManager` sticky intent | **Not checked** at evaluation time — enforced at the `BGProcessingTask` constraint level instead (`requiresExternalPower`) |
+| **Charging event trigger** | `ChargingReceiver` fires evaluation immediately on plug-in | No equivalent — relies on next scheduled `BGTask` |
+| **State persistence** | SharedPreferences (`CAPStorage`) | JSON file in Application Support + UserDefaults dual-write (survives SIGKILL) |
+| **Minimum interval** | 15 min (WorkManager enforced) | 15 min (`earliestBeginDate`), actual timing system-managed |
+| **`aggressive` mode** | 5-min one-shot chain worker — reliable sub-15-min execution | Maps to `BGProcessingTask` without `requiresExternalPower` — still system-scheduled |
+
+**Key tradeoff on iOS constraints:** Android's `NativeJobEvaluator` checks `requiresNetwork` and `requiresCharging` at the moment a job is evaluated and will skip (increment `consecutiveSkips`) if constraints aren't met. On iOS, these constraints are delegated to `BGTaskScheduler` — iOS simply won't launch the background task until the constraints are satisfied. This means:
+
+- On Android, a job can be skipped (and the skip is visible via `consecutiveSkips` / `jobSkipped` event) when constraints aren't met during a background wake.
+- On iOS, the background task itself is delayed until constraints are met, so the job fires when it eventually runs — no skip event is emitted for constraint violations.
+- `activeHours` and `paused` state are checked on **both** platforms by `NativeJobEvaluator` at evaluation time.
 
 ## Advanced: `MobileCronScheduler`
 
@@ -243,9 +265,9 @@ npm run test:coverage # coverage report
 
 Tests cover schedule computation, active-hour windows, persistence, pause/resume, skip logic, native event rehydration, and more.
 
-### Device E2E tests (Android, via CDP)
+### Android E2E tests (CDP)
 
-Full integration suite against a running Android app — 8 sections, 50 tests:
+Full integration suite against a running Android device via Chrome DevTools Protocol — 8 sections, 50 tests:
 
 ```bash
 # 1. Build and install the example app
@@ -259,9 +281,34 @@ adb shell am start -n io.mobilecron.test/.MainActivity
 npm run test:e2e
 ```
 
-The suite covers stress tests, background/foreground cycles, event reliability, edge cases, mode switching, real-world scenarios, native wake, and **native background execution** (WorkManager evaluation, `pendingNativeEvents` rehydration, skip logic, dedup).
+### iOS E2E tests (Simulator)
 
-See [`tests/e2e/test-e2e.mjs`](tests/e2e/test-e2e.mjs) and [`example/`](example/) for details.
+Full integration suite against the iOS Simulator — 8 sections, 50 tests:
+
+```bash
+# 1. Boot a simulator
+xcrun simctl boot "iPhone 16e"
+
+# 2. From the project root, run the suite (builds, installs, launches automatically)
+npm run test:e2e:ios
+```
+
+The iOS suite uses a multi-phase architecture with kill+relaunch cycles to test state persistence across process termination, then runs native background evaluation tests (NativeJobEvaluator, pendingNativeEvents, skip logic, dedup) inline.
+
+### What the E2E suites cover
+
+Both Android and iOS suites validate the same 8 sections:
+
+1. **Stress** — rapid register/unregister/concurrent operations (50+ jobs)
+2. **State persistence** — jobs, paused state, and mode survive kill+relaunch cycles
+3. **Events** — `jobDue`, `statusChanged`, listener add/remove, rapid-fire delivery
+4. **Edge cases** — empty names, missing IDs, large payloads, special characters, idempotent operations
+5. **Mode switching** — eco/balanced/aggressive transitions with active jobs
+6. **Real-world scenarios** — hourly jobs, one-shot schedules, full lifecycle, pause+trigger interactions
+7. **Diagnostics** — platform-specific status fields, `nativeWake` event, BGTask registration (iOS) / WorkManager status (Android)
+8. **Native background** — `NativeJobEvaluator` fires due jobs, `pendingNativeEvents` rehydration, skip-when-paused, `consecutiveSkips` tracking, `nextDueAt` dedup
+
+See [`tests/e2e/test-e2e.mjs`](tests/e2e/test-e2e.mjs) (Android), [`tests/e2e/test-e2e-ios.mjs`](tests/e2e/test-e2e-ios.mjs) (iOS), and [`example/`](example/) for details.
 
 ## Contributing
 
