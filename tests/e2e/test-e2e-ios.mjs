@@ -286,6 +286,8 @@ async function main() {
       { encoding: 'utf8', shell: true }
     ).trim()
     if (!appPath) throw new Error('App.app not found in DerivedData')
+    // Uninstall first to clear app container data (localStorage, state files) between runs.
+    try { simctl(`uninstall ${udid} io.mobilecron.test`) } catch (_) {}
     simctl(`install ${udid} "${appPath}"`)
 
     console.log('  → Launching app...')
