@@ -3,6 +3,8 @@ package io.mobilecron
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.Handler
+import android.os.Looper
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
@@ -29,27 +31,55 @@ class MobileCronPlugin : Plugin() {
     private var mode = "balanced"
     private var chargingReceiver: ChargingReceiver? = null
 
+    // Foreground watchdog — evaluates due jobs while the app is active
+    private val handler = Handler(Looper.getMainLooper())
+    private var watchdogRunning = false
+    private val watchdogRunnable = object : Runnable {
+        override fun run() {
+            if (!watchdogRunning) return
+            evaluateDueJobsForeground()
+            handler.postDelayed(this, tickMs())
+        }
+    }
+
     companion object {
         private const val STORAGE_FILE = "CapacitorStorage"
         private const val STORAGE_KEY = "mobilecron:state"
+        private const val TICK_ECO = 60_000L
+        private const val TICK_BALANCED = 30_000L
+        private const val TICK_AGGRESSIVE = 15_000L
+    }
+
+    private fun tickMs(): Long = when (mode) {
+        "eco" -> TICK_ECO
+        "aggressive" -> TICK_AGGRESSIVE
+        else -> TICK_BALANCED
     }
 
     override fun load() {
         super.load()
         CronBridge.plugin = this
         loadState()
+        computeMissingNextDueAt()
         registerChargingReceiver()
         scheduleWorkManager()
+        startWatchdog()
     }
 
     override fun handleOnResume() {
         super.handleOnResume()
-        // Fire any pendingNativeEvents written by NativeJobEvaluator while the app was backgrounded/killed.
         firePendingNativeEvents()
+        startWatchdog()
+    }
+
+    override fun handleOnPause() {
+        super.handleOnPause()
+        stopWatchdog()
     }
 
     override fun handleOnDestroy() {
         super.handleOnDestroy()
+        stopWatchdog()
         if (CronBridge.plugin === this) {
             CronBridge.plugin = null
         }
@@ -57,6 +87,115 @@ class MobileCronPlugin : Plugin() {
             runCatching { context.unregisterReceiver(it) }
         }
         chargingReceiver = null
+    }
+
+    // ── Foreground watchdog ───────────────────────────────────────────────────
+
+    private fun startWatchdog() {
+        if (watchdogRunning) return
+        watchdogRunning = true
+        handler.postDelayed(watchdogRunnable, tickMs())
+    }
+
+    private fun stopWatchdog() {
+        watchdogRunning = false
+        handler.removeCallbacks(watchdogRunnable)
+    }
+
+    private fun restartWatchdog() {
+        stopWatchdog()
+        startWatchdog()
+    }
+
+    /**
+     * Evaluate due jobs while the app is in the foreground.
+     * Directly emits jobDue events via notifyListeners (no SharedPreferences round-trip).
+     * Mirrors the logic in NativeJobEvaluator but operates on the in-memory jobs map.
+     */
+    private fun evaluateDueJobsForeground() {
+        val now = System.currentTimeMillis()
+        var mutated = false
+
+        for ((id, job) in jobs) {
+            if (!job.optBoolean("enabled", false)) continue
+
+            // Compute nextDueAt if missing
+            val schedule = try { job.getJSONObject("schedule") } catch (_: Exception) { continue }
+            var nextDueAt = readLong(job.opt("nextDueAt"))
+            if (nextDueAt == null) {
+                nextDueAt = NativeJobEvaluator.computeNextDueAt(schedule, now)
+                if (nextDueAt != null) {
+                    job.put("nextDueAt", nextDueAt)
+                    mutated = true
+                }
+            }
+
+            if (nextDueAt == null || nextDueAt > now) continue
+
+            // Check skip reasons
+            if (paused) continue
+
+            val activeHours = try { job.getJSONObject("activeHours") } catch (_: Exception) { null }
+            if (activeHours != null && !NativeJobEvaluator.isWithinActiveHours(activeHours, now)) {
+                job.put("consecutiveSkips", job.optInt("consecutiveSkips", 0) + 1)
+                job.put("updatedAt", now)
+                if (schedule.optString("kind") == "every") {
+                    val next = NativeJobEvaluator.computeNextDueAt(schedule, now)
+                    if (next != null) job.put("nextDueAt", next) else job.remove("nextDueAt")
+                }
+                mutated = true
+                continue
+            }
+
+            // Fire the job
+            job.put("lastFiredAt", now)
+            job.put("updatedAt", now)
+            job.put("consecutiveSkips", 0)
+
+            if (schedule.optString("kind") == "at") {
+                job.put("enabled", false)
+                job.remove("nextDueAt")
+            } else {
+                val next = NativeJobEvaluator.computeNextDueAt(schedule, now)
+                if (next != null) job.put("nextDueAt", next) else job.remove("nextDueAt")
+            }
+
+            mutated = true
+
+            // Emit jobDue directly to JS listeners
+            val payload = JSObject()
+            payload.put("id", id)
+            payload.put("name", job.optString("name"))
+            payload.put("firedAt", now)
+            payload.put("source", "watchdog")
+            if (job.has("data")) {
+                try { payload.put("data", job.getJSONObject("data")) } catch (_: Exception) {}
+            }
+            notifyListeners("jobDue", payload)
+        }
+
+        if (mutated) {
+            saveState()
+        }
+    }
+
+    /**
+     * Compute nextDueAt for all jobs that are missing it (e.g. after loadState from storage).
+     */
+    private fun computeMissingNextDueAt() {
+        val now = System.currentTimeMillis()
+        var mutated = false
+        for ((_, job) in jobs) {
+            if (!job.optBoolean("enabled", false)) continue
+            if (readLong(job.opt("nextDueAt")) != null) continue
+            val schedule = try { job.getJSONObject("schedule") } catch (_: Exception) { continue }
+            val computed = NativeJobEvaluator.computeNextDueAt(schedule, now)
+            if (computed != null) {
+                job.put("nextDueAt", computed)
+                mutated = true
+            }
+        }
+        if (mutated) saveState()
     }
 
     // ── Persistence ─────────────────────────────────────────────────────────
@@ -200,17 +339,29 @@ class MobileCronPlugin : Plugin() {
         }
 
         val id = UUID.randomUUID().toString()
+        val now = System.currentTimeMillis()
+        val schedule = call.getObject("schedule") ?: JSObject()
+
         val record = JSObject()
         record.put("id", id)
         record.put("name", name)
         record.put("enabled", true)
-        record.put("schedule", call.getObject("schedule") ?: JSObject())
+        record.put("schedule", schedule)
         record.put("activeHours", call.getObject("activeHours"))
         record.put("requiresNetwork", call.getBoolean("requiresNetwork", false))
         record.put("requiresCharging", call.getBoolean("requiresCharging", false))
         record.put("priority", call.getString("priority", "normal"))
         call.getObject("data")?.let { record.put("data", it) }
         record.put("consecutiveSkips", 0)
+        record.put("createdAt", now)
+        record.put("updatedAt", now)
+
+        // Compute nextDueAt at registration time
+        val nextDueAt = NativeJobEvaluator.computeNextDueAt(schedule, now)
+        if (nextDueAt != null) {
+            record.put("nextDueAt", nextDueAt)
+        }
+
         jobs[id] = record
         saveState()
 
@@ -247,12 +398,18 @@ class MobileCronPlugin : Plugin() {
         }
 
         call.getString("name")?.let { existing.put("name", it) }
-        call.getObject("schedule")?.let { existing.put("schedule", it) }
+        call.getObject("schedule")?.let {
+            existing.put("schedule", it)
+            // Recompute nextDueAt when schedule changes
+            val next = NativeJobEvaluator.computeNextDueAt(it, System.currentTimeMillis())
+            if (next != null) existing.put("nextDueAt", next) else existing.remove("nextDueAt")
+        }
         if (call.data.has("activeHours")) existing.put("activeHours", call.getObject("activeHours"))
         if (call.data.has("requiresNetwork")) existing.put("requiresNetwork", call.getBoolean("requiresNetwork", false))
         if (call.data.has("requiresCharging")) existing.put("requiresCharging", call.getBoolean("requiresCharging", false))
         call.getString("priority")?.let { existing.put("priority", it) }
         if (call.data.has("data")) existing.put("data", call.getObject("data"))
+        existing.put("updatedAt", System.currentTimeMillis())
 
         jobs[id] = existing
         saveState()
@@ -318,6 +475,7 @@ class MobileCronPlugin : Plugin() {
         mode = next!!
         scheduleWorkManager()
         saveState()
+        restartWatchdog()
         call.resolve()
         notifyListeners("statusChanged", buildStatus())
     }
@@ -338,5 +496,14 @@ class MobileCronPlugin : Plugin() {
             put("chargingReceiverActive", chargingReceiver != null)
         })
         return status
+    }
+
+    private fun readLong(value: Any?): Long? {
+        return when (value) {
+            null -> null
+            is Number -> value.toLong()
+            is String -> value.toLongOrNull()
+            else -> null
+        }
     }
 }

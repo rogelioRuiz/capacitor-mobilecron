@@ -28,11 +28,23 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
     var currentMode: String { mode }
     private var bgManager: BGTaskManager?
 
+    // Foreground watchdog — evaluates due jobs while the app is active
+    private var watchdogTimer: Timer?
+
+    private var tickInterval: TimeInterval {
+        switch mode {
+        case "eco": return 60.0
+        case "aggressive": return 15.0
+        default: return 30.0
+        }
+    }
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     public override func load() {
         super.load()
         loadState()
+        computeMissingNextDueAt()
         firePendingNativeEvents()
         let manager = BGTaskManager(plugin: self)
         manager.registerBGTasks()
@@ -45,16 +57,143 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
             name: UIApplication.didBecomeActiveNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillResignActive),
+            name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+        startWatchdog()
     }
 
     @objc private func appDidBecomeActive() {
         firePendingNativeEvents()
+        startWatchdog()
+    }
+
+    @objc private func appWillResignActive() {
+        stopWatchdog()
     }
 
     func handleBackgroundWake(source: String) {
         firePendingNativeEvents()
         notifyListeners("statusChanged", data: buildStatus())
         notifyListeners("nativeWake", data: ["source": source, "paused": paused])
+    }
+
+    // ── Foreground watchdog ───────────────────────────────────────────────────
+
+    private func startWatchdog() {
+        guard watchdogTimer == nil else { return }
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: tickInterval, repeats: true) { [weak self] _ in
+            self?.evaluateDueJobsForeground()
+        }
+    }
+
+    private func stopWatchdog() {
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+    }
+
+    private func restartWatchdog() {
+        stopWatchdog()
+        startWatchdog()
+    }
+
+    /// Evaluate due jobs while the app is in the foreground.
+    /// Directly emits jobDue events via notifyListeners (no file round-trip).
+    private func evaluateDueJobsForeground() {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        var mutated = false
+
+        for (id, var job) in jobs {
+            guard (job["enabled"] as? Bool) == true else { continue }
+            guard let schedule = job["schedule"] as? [String: Any] else { continue }
+
+            // Compute nextDueAt if missing
+            var nextDueAt = readLong(job["nextDueAt"])
+            if nextDueAt == nil {
+                if let computed = NativeJobEvaluator.computeNextDueAt(schedule: schedule, nowMs: now) {
+                    nextDueAt = computed
+                    job["nextDueAt"] = computed
+                    jobs[id] = job
+                    mutated = true
+                }
+            }
+
+            guard let due = nextDueAt, due <= now else { continue }
+
+            // Check skip reasons
+            if paused { continue }
+
+            if let activeHours = job["activeHours"] as? [String: Any],
+               !NativeJobEvaluator.isWithinActiveHours(activeHours: activeHours, nowMs: now) {
+                job["consecutiveSkips"] = ((job["consecutiveSkips"] as? Int) ?? 0) + 1
+                job["updatedAt"] = now
+                if (schedule["kind"] as? String) == "every" {
+                    if let next = NativeJobEvaluator.computeNextDueAt(schedule: schedule, nowMs: now) {
+                        job["nextDueAt"] = next
+                    } else {
+                        job.removeValue(forKey: "nextDueAt")
+                    }
+                }
+                jobs[id] = job
+                mutated = true
+                continue
+            }
+
+            // Fire the job
+            job["lastFiredAt"] = now
+            job["updatedAt"] = now
+            job["consecutiveSkips"] = 0
+
+            if (schedule["kind"] as? String) == "at" {
+                job["enabled"] = false
+                job.removeValue(forKey: "nextDueAt")
+            } else {
+                if let next = NativeJobEvaluator.computeNextDueAt(schedule: schedule, nowMs: now) {
+                    job["nextDueAt"] = next
+                } else {
+                    job.removeValue(forKey: "nextDueAt")
+                }
+            }
+
+            jobs[id] = job
+            mutated = true
+
+            // Emit jobDue directly to JS listeners
+            var payload: [String: Any] = [
+                "id": id,
+                "name": (job["name"] as? String) ?? "",
+                "firedAt": now,
+                "source": "watchdog"
+            ]
+            if let data = job["data"] {
+                payload["data"] = data
+            }
+            notifyListeners("jobDue", data: payload)
+        }
+
+        if mutated {
+            saveState()
+        }
+    }
+
+    /// Compute nextDueAt for all jobs that are missing it (e.g. after loadState from storage).
+    private func computeMissingNextDueAt() {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        var mutated = false
+        for (id, var job) in jobs {
+            guard (job["enabled"] as? Bool) == true else { continue }
+            guard readLong(job["nextDueAt"]) == nil else { continue }
+            guard let schedule = job["schedule"] as? [String: Any] else { continue }
+            if let computed = NativeJobEvaluator.computeNextDueAt(schedule: schedule, nowMs: now) {
+                job["nextDueAt"] = computed
+                jobs[id] = job
+                mutated = true
+            }
+        }
+        if mutated { saveState() }
     }
 
     // ── Persistence ───────────────────────────────────────────────────────────
@@ -144,18 +283,28 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         let id = UUID().uuidString
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let schedule = call.getObject("schedule") ?? [:]
+
         var record: [String: Any] = [
             "id": id,
             "name": name,
             "enabled": true,
-            "consecutiveSkips": 0
+            "consecutiveSkips": 0,
+            "createdAt": now,
+            "updatedAt": now
         ]
-        if let schedule = call.getObject("schedule") { record["schedule"] = schedule }
+        record["schedule"] = schedule
         if let activeHours = call.getObject("activeHours") { record["activeHours"] = activeHours }
         if call.options.keys.contains("requiresNetwork") { record["requiresNetwork"] = call.getBool("requiresNetwork") ?? false }
         if call.options.keys.contains("requiresCharging") { record["requiresCharging"] = call.getBool("requiresCharging") ?? false }
         if let priority = call.getString("priority") { record["priority"] = priority }
         if let data = call.getObject("data") { record["data"] = data }
+
+        // Compute nextDueAt at registration time
+        if let nextDueAt = NativeJobEvaluator.computeNextDueAt(schedule: schedule, nowMs: now) {
+            record["nextDueAt"] = nextDueAt
+        }
 
         jobs[id] = record
         saveState()
@@ -185,12 +334,22 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         if let name = call.getString("name") { existing["name"] = name }
-        if let schedule = call.getObject("schedule") { existing["schedule"] = schedule }
+        if let schedule = call.getObject("schedule") {
+            existing["schedule"] = schedule
+            // Recompute nextDueAt when schedule changes
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            if let next = NativeJobEvaluator.computeNextDueAt(schedule: schedule, nowMs: now) {
+                existing["nextDueAt"] = next
+            } else {
+                existing.removeValue(forKey: "nextDueAt")
+            }
+        }
         if call.options.keys.contains("activeHours") { existing["activeHours"] = call.getObject("activeHours") }
         if call.options.keys.contains("requiresNetwork") { existing["requiresNetwork"] = call.getBool("requiresNetwork") ?? false }
         if call.options.keys.contains("requiresCharging") { existing["requiresCharging"] = call.getBool("requiresCharging") ?? false }
         if let priority = call.getString("priority") { existing["priority"] = priority }
         if call.options.keys.contains("data") { existing["data"] = call.getObject("data") }
+        existing["updatedAt"] = Int64(Date().timeIntervalSince1970 * 1000)
 
         jobs[id] = existing
         saveState()
@@ -250,6 +409,7 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
             bgManager.scheduleProcessing(requiresExternalPower: mode != "aggressive")
         }
         saveState()
+        restartWatchdog()
         notifyListeners("statusChanged", data: buildStatus())
         call.resolve()
     }
@@ -330,5 +490,13 @@ public class MobileCronPlugin: CAPPlugin, CAPBridgedPlugin {
                 "bgContinuedAvailable": diagnostics.bgContinuedAvailable
             ]
         ]
+    }
+
+    private func readLong(_ value: Any?) -> Int64? {
+        switch value {
+        case let n as NSNumber: return n.int64Value
+        case let s as String: return Int64(s)
+        default: return nil
+        }
     }
 }
