@@ -10,7 +10,10 @@ class CronWorker(
 ) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result {
         NativeJobEvaluator.evaluate(applicationContext, "workmanager")
-        CronBridge.wake("workmanager")
+        val handledNatively = NativeAgentBridge.handleWake(applicationContext, "workmanager")
+        if (!handledNatively) {
+            CronBridge.wake("workmanager")
+        }
         return Result.success()
     }
 }

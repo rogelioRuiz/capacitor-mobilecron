@@ -142,7 +142,7 @@ final class NativeJobEvaluator {
         return firedEvents
     }
 
-    private static func computeNextDueAt(schedule: [String: Any]?, nowMs: Int64) -> Int64? {
+    static func computeNextDueAt(schedule: [String: Any]?, nowMs: Int64) -> Int64? {
         guard let schedule else { return nil }
         switch scheduleKind(schedule) {
         case "at":
@@ -171,7 +171,7 @@ final class NativeJobEvaluator {
         return nil
     }
 
-    private static func isWithinActiveHours(activeHours: [String: Any], nowMs: Int64) -> Bool {
+    static func isWithinActiveHours(activeHours: [String: Any], nowMs: Int64) -> Bool {
         guard let startValue = activeHours["start"] as? String,
               let endValue = activeHours["end"] as? String,
               let start = parseClock(startValue),

@@ -37,6 +37,7 @@ repositories {
 
 dependencies {
     implementation project(':capacitor-android')
+    compileOnly project(':capacitor-native-agent')
     implementation "org.jetbrains.kotlin:kotlin-stdlib"
     implementation "androidx.work:work-runtime-ktx:2.9.0"
     testImplementation "junit:junit:$junitVersion"
